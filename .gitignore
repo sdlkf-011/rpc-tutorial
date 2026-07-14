@@ -1,0 +1,44 @@
+# Build directories
+/build/
+/cmake-build-*/
+/out/
+/bin/
+/lib/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile
+
+# Logs and runtime artifacts
+/logs/
+*.log
+*.pid
+core.*
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated protobuf
+*.pb.cc
+*.pb.h
+
+# Coverage
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Temporary
+*.tmp
+*.swp
+
+# clangd
+.clangd
