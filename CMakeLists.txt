@@ -25,7 +25,7 @@ file(GLOB_RECURSE COMMON_SOURCES CONFIGURE_DEPENDS
 )
 
 # 排除三个程序入口
-list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/server_main\\.(cc|cpp)$")
+list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/servers_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/client_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/stress_test_client\\.(cc|cpp)$")
 
