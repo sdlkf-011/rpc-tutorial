@@ -15,6 +15,25 @@ find_package(fmt CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
+find_package(unofficial-zookeeper CONFIG REQUIRED)
+
+# ServiceRegistry 使用 ZooKeeper 同步 API；通过 vcpkg 安装时需要启用
+# zookeeper[sync] 特性。
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_DEFINITIONS -DTHREADED)
+set(CMAKE_REQUIRED_LIBRARIES unofficial::zookeeper::zookeeper)
+check_cxx_source_compiles([[
+  #include <zookeeper/zookeeper.h>
+  int main() {
+    return zoo_exists(nullptr, "/", 0, nullptr);
+  }
+]] ZOOKEEPER_HAS_SYNC_API)
+unset(CMAKE_REQUIRED_DEFINITIONS)
+unset(CMAKE_REQUIRED_LIBRARIES)
+if(NOT ZOOKEEPER_HAS_SYNC_API)
+  message(FATAL_ERROR
+    "ZooKeeper synchronous API is required; install zookeeper[sync]")
+endif()
 
 # 收集公共源码
 file(GLOB_RECURSE COMMON_SOURCES CONFIGURE_DEPENDS
@@ -55,12 +74,14 @@ target_link_libraries(rpc_common
     spdlog::spdlog
     nlohmann_json::nlohmann_json
     zstd::libzstd
+    unofficial::zookeeper::zookeeper
 )
 
 # 定义工程版本宏
 target_compile_definitions(rpc_common
   PUBLIC
     RPC_TUTORIAL_VERSION="${PROJECT_VERSION}"
+    THREADED
 )
 
 # 开启编译警告
