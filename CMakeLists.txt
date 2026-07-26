@@ -47,6 +47,7 @@ file(GLOB_RECURSE COMMON_SOURCES CONFIGURE_DEPENDS
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/servers_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/client_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/stress_test_client\\.(cc|cpp)$")
+list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/load_balancer_test\\.(cc|cpp)$")
 
 # 添加 protobuf 生成代码
 list(APPEND COMMON_SOURCES
@@ -134,3 +135,25 @@ target_link_libraries(stress_test_client
 )
 
 enable_project_warnings(stress_test_client)
+
+# GoogleTest 测试仅在 BUILD_TESTING 开启时参与构建。
+include(CTest)
+
+if(BUILD_TESTING)
+  find_package(GTest CONFIG REQUIRED)
+
+  add_executable(load_balancer_test
+    rpc_src/tools/load_balancer_test.cc
+  )
+
+  target_link_libraries(load_balancer_test
+    PRIVATE
+      rpc_common
+      GTest::gtest_main
+  )
+
+  enable_project_warnings(load_balancer_test)
+
+  include(GoogleTest)
+  gtest_discover_tests(load_balancer_test)
+endif()
