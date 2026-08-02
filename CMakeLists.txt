@@ -43,11 +43,12 @@ file(GLOB_RECURSE COMMON_SOURCES CONFIGURE_DEPENDS
   "${PROJECT_SOURCE_DIR}/utils/*.cc"
 )
 
-# 排除三个程序入口
+# 排除程序入口和测试源码
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/servers_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/client_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/stress_test_client\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/load_balancer_test\\.(cc|cpp)$")
+list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/aes_encrypt_test\\.(cc|cpp)$")
 
 # 添加 protobuf 生成代码
 list(APPEND COMMON_SOURCES
@@ -154,6 +155,19 @@ if(BUILD_TESTING)
 
   enable_project_warnings(load_balancer_test)
 
+  add_executable(aes_encrypt_test
+    rpc_src/tools/aes_encrypt_test.cc
+  )
+
+  target_link_libraries(aes_encrypt_test
+    PRIVATE
+      rpc_common
+      GTest::gtest_main
+  )
+
+  enable_project_warnings(aes_encrypt_test)
+
   include(GoogleTest)
   gtest_discover_tests(load_balancer_test)
+  gtest_discover_tests(aes_encrypt_test)
 endif()
