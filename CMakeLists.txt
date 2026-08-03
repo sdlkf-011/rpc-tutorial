@@ -48,6 +48,7 @@ list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/servers_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/client_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/stress_test_client\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/load_balancer_test\\.(cc|cpp)$")
+list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/serializer_test\\.(cc|cpp)$")
 
 # 添加 protobuf 生成代码
 list(APPEND COMMON_SOURCES
@@ -146,14 +147,26 @@ if(BUILD_TESTING)
     rpc_src/tools/load_balancer_test.cc
   )
 
+  add_executable(serializer_test
+    rpc_src/tools/serializer_test.cc
+  )
+
   target_link_libraries(load_balancer_test
     PRIVATE
       rpc_common
       GTest::gtest_main
   )
 
+  target_link_libraries(serializer_test
+    PRIVATE
+      rpc_common
+      GTest::gtest_main
+  )
+
   enable_project_warnings(load_balancer_test)
+  enable_project_warnings(serializer_test)
 
   include(GoogleTest)
   gtest_discover_tests(load_balancer_test)
+  gtest_discover_tests(serializer_test)
 endif()
