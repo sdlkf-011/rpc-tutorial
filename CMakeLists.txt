@@ -152,6 +152,10 @@ if(BUILD_TESTING)
     rpc_src/tools/serializer_test.cc
   )
 
+  add_executable(rpc_protocol_test
+    rpc_src/tools/rpc_protocol_test.cc
+  )
+
   target_link_libraries(load_balancer_test
     PRIVATE
       rpc_common
@@ -159,6 +163,12 @@ if(BUILD_TESTING)
   )
 
   target_link_libraries(serializer_test
+    PRIVATE
+      rpc_common
+      GTest::gtest_main
+  )
+
+  target_link_libraries(rpc_protocol_test
     PRIVATE
       rpc_common
       GTest::gtest_main
