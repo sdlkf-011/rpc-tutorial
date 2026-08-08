@@ -48,6 +48,7 @@ list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/servers_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/client_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/stress_test_client\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/load_balancer_test\\.(cc|cpp)$")
+list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/zstd_compress_test\\.(cc|cpp)$")
 
 # 添加 protobuf 生成代码
 list(APPEND COMMON_SOURCES
@@ -156,4 +157,18 @@ if(BUILD_TESTING)
 
   include(GoogleTest)
   gtest_discover_tests(load_balancer_test)
+
+  add_executable(zstd_compress_test
+    rpc_src/tools/zstd_compress_test.cc
+  )
+
+  target_link_libraries(zstd_compress_test
+    PRIVATE
+      rpc_common
+      GTest::gtest_main
+  )
+
+  enable_project_warnings(zstd_compress_test)
+
+  gtest_discover_tests(zstd_compress_test)
 endif()
