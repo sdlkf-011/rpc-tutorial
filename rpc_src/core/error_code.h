@@ -1,5 +1,5 @@
-#ifndef RPC_TUTORIAL_CORE_ERROR_CODE_H_
-#define RPC_TUTORIAL_CORE_ERROR_CODE_H_
+#ifndef RPC_TUTORIAL_RPC_SRC_CORE_ERROR_CODE_H_
+#define RPC_TUTORIAL_RPC_SRC_CORE_ERROR_CODE_H_
 
 #include <cstdint>
 #include <string>
@@ -126,4 +126,4 @@ class ErrorResult {
 
 } // namespace cookrpc
 
-#endif // RPC_TUTORIAL_CORE_ERROR_CODE_H_
+#endif // RPC_TUTORIAL_RPC_SRC_CORE_ERROR_CODE_H_
