@@ -157,6 +157,10 @@ if(BUILD_TESTING)
     rpc_src/test/rpc_protocol_test.cc
   )
 
+  add_executable(service_test
+    rpc_src/test/service_test.cc
+  )
+
   target_link_libraries(load_balancer_test
     PRIVATE
       rpc_common
@@ -175,7 +179,14 @@ if(BUILD_TESTING)
       GTest::gtest_main
   )
 
+  target_link_libraries(service_test
+    PRIVATE
+      rpc_common
+      GTest::gtest_main
+  )
+
   enable_project_warnings(load_balancer_test)
+  enable_project_warnings(service_test)
 
   add_executable(aes_encrypt_test
     rpc_src/test/aes_encrypt_test.cc
@@ -206,4 +217,5 @@ if(BUILD_TESTING)
 
   gtest_discover_tests(zstd_compress_test)
   gtest_discover_tests(aes_encrypt_test)
+  gtest_discover_tests(service_test)
 endif()
