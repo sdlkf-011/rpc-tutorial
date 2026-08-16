@@ -47,6 +47,7 @@ file(GLOB_RECURSE COMMON_SOURCES CONFIGURE_DEPENDS
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/servers_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/client_main\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/stress_test_client\\.(cc|cpp)$")
+list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/rpc_src/test/.*\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/load_balancer_test\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/zstd_compress_test\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/aes_encrypt_test\\.(cc|cpp)$")
@@ -145,15 +146,19 @@ if(BUILD_TESTING)
   find_package(GTest CONFIG REQUIRED)
 
   add_executable(load_balancer_test
-    rpc_src/tools/load_balancer_test.cc
+    rpc_src/test/load_balancer_test.cc
   )
 
   add_executable(serializer_test
-    rpc_src/tools/serializer_test.cc
+    rpc_src/test/serializer_test.cc
   )
 
   add_executable(rpc_protocol_test
-    rpc_src/tools/rpc_protocol_test.cc
+    rpc_src/test/rpc_protocol_test.cc
+  )
+
+  add_executable(service_test
+    rpc_src/test/service_test.cc
   )
 
   target_link_libraries(load_balancer_test
@@ -174,10 +179,17 @@ if(BUILD_TESTING)
       GTest::gtest_main
   )
 
+  target_link_libraries(service_test
+    PRIVATE
+      rpc_common
+      GTest::gtest_main
+  )
+
   enable_project_warnings(load_balancer_test)
+  enable_project_warnings(service_test)
 
   add_executable(aes_encrypt_test
-    rpc_src/tools/aes_encrypt_test.cc
+    rpc_src/test/aes_encrypt_test.cc
   )
 
   target_link_libraries(aes_encrypt_test
@@ -192,7 +204,7 @@ if(BUILD_TESTING)
   gtest_discover_tests(load_balancer_test)
 
   add_executable(zstd_compress_test
-    rpc_src/tools/zstd_compress_test.cc
+    rpc_src/test/zstd_compress_test.cc
   )
 
   target_link_libraries(zstd_compress_test
@@ -205,4 +217,5 @@ if(BUILD_TESTING)
 
   gtest_discover_tests(zstd_compress_test)
   gtest_discover_tests(aes_encrypt_test)
+  gtest_discover_tests(service_test)
 endif()
