@@ -65,6 +65,17 @@ target_include_directories(rpc_common
   PUBLIC
     ${PROJECT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/rpc_src
+    ${PROJECT_SOURCE_DIR}/rpc_src/compress_data
+    ${PROJECT_SOURCE_DIR}/rpc_src/conn_balancer
+    ${PROJECT_SOURCE_DIR}/rpc_src/core
+    ${PROJECT_SOURCE_DIR}/rpc_src/encrypt
+    ${PROJECT_SOURCE_DIR}/rpc_src/load_config
+    ${PROJECT_SOURCE_DIR}/rpc_src/network
+    ${PROJECT_SOURCE_DIR}/rpc_src/protocol
+    ${PROJECT_SOURCE_DIR}/rpc_src/registry
+    ${PROJECT_SOURCE_DIR}/rpc_src/serializer
+    ${PROJECT_SOURCE_DIR}/rpc_src/service
+    ${PROJECT_SOURCE_DIR}/rpc_src/thread_pool
     ${PROJECT_SOURCE_DIR}/protos
     ${PROJECT_SOURCE_DIR}/utils
 )

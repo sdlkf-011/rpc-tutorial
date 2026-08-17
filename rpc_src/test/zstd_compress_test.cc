@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "compress_data/zstd_compress.h"
+#include "zstd_compress.h"
 
 namespace cookrpc {
 namespace {

@@ -4,7 +4,7 @@
 #include <memory>
 #include <string>
 
-#include "load_config/rpc_server_config.h"
+#include "rpc_server_config.h"
 
 namespace cookrpc {
 

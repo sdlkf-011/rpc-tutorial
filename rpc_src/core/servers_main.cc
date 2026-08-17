@@ -13,14 +13,14 @@
 
 #include <nlohmann/json.hpp>
 
-#include "conn_balancer/zk_conn_handler.h"
-#include "core/rpc_service.h"
-#include "load_config/rpc_server_config.h"
+#include "zk_conn_handler.h"
+#include "rpc_service.h"
+#include "rpc_server_config.h"
 #include "log_manager.h"
-#include "network/create_socket.h"
-#include "network/message_cycle.h"
-#include "service/service_manager.h"
-#include "thread_pool/thread_pool_singleton.h"
+#include "create_socket.h"
+#include "message_cycle.h"
+#include "service_manager.h"
+#include "thread_pool_singleton.h"
 
 namespace {
 

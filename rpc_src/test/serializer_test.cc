@@ -6,9 +6,9 @@
 #include <nlohmann/json.hpp>
 
 #include "message.pb.h"
-#include "serializer/json_serializer.h"
-#include "serializer/protobuf_serializer.h"
-#include "serializer/serializer_manager.h"
+#include "json_serializer.h"
+#include "protobuf_serializer.h"
+#include "serializer_manager.h"
 
 namespace cookrpc {
 namespace {

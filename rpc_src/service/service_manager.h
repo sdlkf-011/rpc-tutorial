@@ -11,7 +11,7 @@
 
 #include "log_manager.h"
 #include "service.h"
-#include "thread_pool/thread_pool_singleton.h"
+#include "thread_pool_singleton.h"
 
 namespace cookrpc {
 

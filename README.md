@@ -1,93 +1,121 @@
 # rpc-tutorial
 
+一个基于 C++17 的教学型 RPC 项目，包含客户端、服务端、连接管理、线程池、序列化、压缩、加密和 ZooKeeper 服务注册/发现等模块。
 
+## 功能概览
 
-## Getting started
+- `rpc_server`：读取服务端配置并注册服务，接受 RPC 请求。
+- `rpc_client`：从 ZooKeeper 发现服务并发送请求。
+- `stress_test_client`：用于基础压力测试。
+- 公共组件：TCP 网络通信、连接负载均衡、线程池、JSON/Protobuf 序列化、Zstd 压缩和 AES 加密。
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## 环境要求
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+- Linux（代码使用 POSIX socket、`epoll` 和 pthread API）。
+- CMake 3.20 或更高版本。
+- 支持 C++17 的编译器（GCC 9+ 或 Clang 10+）。
+- Protobuf、fmt、spdlog、nlohmann-json、zstd、ZooKeeper C client 和 GoogleTest（测试需要）。
+- 正常运行 RPC 服务需要 ZooKeeper 服务端，默认地址为 `localhost:2181`。
 
-## Add your files
+项目使用 vcpkg 的 CMake config package。安装依赖后设置 `VCPKG_ROOT`，例如：
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
+```bash
+export VCPKG_ROOT=/path/to/vcpkg
+${VCPKG_ROOT}/vcpkg install protobuf fmt spdlog nlohmann-json zstd zookeeper[sync] gtest
 ```
-cd existing_repo
-git remote add origin http://git.cpptrain.top/zhouhuijun/rpc-tutorial.git
-git branch -M main
-git push -uf origin main
+
+其中 `zookeeper[sync]` 特性是必须的，因为服务注册使用 ZooKeeper 同步 API。
+
+## 构建
+
+推荐使用仓库提供的脚本。脚本会先重新生成 `protos/message.pb.h` 和 `protos/message.pb.cc`，然后配置并编译项目：
+
+```bash
+export VCPKG_ROOT=/path/to/vcpkg
+./rpc_build.sh
 ```
 
-## Integrate with your tools
+也可以直接使用 CMake：
 
-- [ ] [Set up project integrations](http://git.cpptrain.top/zhouhuijun/rpc-tutorial/-/settings/integrations)
+```bash
+./protos/compile_proto.sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+cmake --build build --parallel
+```
 
-## Collaborate with your team
+构建产物位于 `build/`：`rpc_server`、`rpc_client` 和 `stress_test_client`。
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+## 运行
 
-## Test and Deploy
+默认配置文件中的路径是相对于当前工作目录的，因此建议从 `build/` 目录启动程序：
 
-Use the built-in continuous integration in GitLab.
+```bash
+# 终端 1：先启动 ZooKeeper，再启动服务端
+cd build
+./rpc_server ../config/rpc_server.json
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+# 终端 2：启动客户端
+cd build
+./rpc_client ../config/rpc_client.json
+```
 
-***
+配置示例位于 `config/`：
 
-# Editing this README
+- `rpc_server.json`：监听地址、端口、线程池、负载均衡和服务注册配置。
+- `rpc_client.json`：ZooKeeper 地址、命名空间、服务端口和重试参数。
+- `servers.json`：服务名、版本和注册节点列表。
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+运行前请根据部署环境修改 ZooKeeper 地址、监听地址和端口。
 
-## Suggestions for a good README
+## 测试
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+开启 CTest 后构建 GoogleTest 测试目标：
 
-## Name
-Choose a self-explaining name for your project.
+```bash
+cmake -S . -B build -DBUILD_TESTING=ON \
+  -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+当前测试覆盖负载均衡、序列化、RPC 协议、服务管理、AES 加密和 Zstd 压缩。
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## 头文件引用规则
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+项目内部头文件统一使用不带目录的形式，例如：
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+```cpp
+#include "error_code.h"
+```
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+`#include "core/error_code.h"` 把源码目录结构暴露给调用方，项目现在不再使用这种写法。CMake 在 `target_include_directories(rpc_common)` 中加入了 `rpc_src/core`、`rpc_src/network`、`rpc_src/protocol` 等模块目录，并将这些目录传递给链接 `rpc_common` 的目标。
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+编译器遇到双引号包含时，会先查找当前源文件目录，然后按编译命令中的 `-I`（CMake 的 include directory）顺序查找。因为编译命令包含：
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+```text
+-I<项目>/rpc_src/core
+-I<项目>/rpc_src/network
+...
+```
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+所以它能在 `rpc_src/core/error_code.h` 找到 `error_code.h`。这不是编译器自动知道项目结构，而是构建系统明确配置了头文件搜索路径。新增模块目录时，也应同步加入 `target_include_directories`，或采用项目中一致的 CMake 目录管理方式。
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+第三方库仍使用各自的标准写法，例如 `<nlohmann/json.hpp>`；Protobuf 生成文件中的 `google/protobuf/...` 引用也不应改成项目内部头文件名。
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+## 目录结构
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+```text
+rpc_src/       RPC 核心源码，按网络、协议、序列化等模块划分
+utils/         日志和通用工具
+protos/        Protobuf 定义及生成代码
+config/        服务端、客户端和注册中心配置示例
+docs/          补充文档
+```
 
-## License
-For open source projects, say how it is licensed.
+## 开发约定
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- 使用 C++17，提交前运行 `git diff --check`。
+- 修改 `.proto` 后重新运行 `./protos/compile_proto.sh`。
+- 新增内部头文件引用时使用 `#include "file.h"`，并确保对应目录在 CMake 的 include path 中。
+- 配置文件中的敏感地址和部署参数不要提交为生产环境值。

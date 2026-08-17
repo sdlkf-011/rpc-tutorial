@@ -10,11 +10,11 @@
 #include <stdexcept>
 #include <string>
 
-#include "core/error_code.h"
+#include "error_code.h"
 #include "log_manager.h"
-#include "network/connection.h"
-#include "protocol/rpc_protocol.h"
-#include "serializer/serializer_manager.h"
+#include "connection.h"
+#include "rpc_protocol.h"
+#include "serializer_manager.h"
 
 namespace cookrpc {
 

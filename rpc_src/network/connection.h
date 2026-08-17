@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "protocol/rpc_protocol.h"
+#include "rpc_protocol.h"
 
 namespace cookrpc {
 

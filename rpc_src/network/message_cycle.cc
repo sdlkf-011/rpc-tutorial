@@ -1,4 +1,4 @@
-#include "network/message_cycle.h"
+#include "message_cycle.h"
 
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -12,7 +12,7 @@
 #include <string>
 
 #include "log_manager.h"
-#include "thread_pool/thread_pool_singleton.h"
+#include "thread_pool_singleton.h"
 
 namespace cookrpc {
 namespace {
