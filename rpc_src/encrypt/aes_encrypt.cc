@@ -1,115 +1,129 @@
 #include "aes_encrypt.h"
 
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
+#include <array>
+#include <climits>
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
-#include <random>
+#include <memory>
 #include <string>
-#include <vector>
 
 #include "log_manager.h"
 
 namespace cookrpc {
 namespace {
-// Base64 字符表
-const std::string BASE64_CHARS =
-  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-// 生成指定长度的随机字节序列
-std::string GenerateRandomBytes(size_t length) {
-  std::string result;
-  result.reserve(length);
+constexpr unsigned char kCiphertextVersion = 1;
+constexpr char kMasterKeyEnvironment[] = "COOKRPC_MASTER_KEY_HEX";
+const std::string kBase64Characters =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-  std::random_device rd;
-  std::mt19937 gen(rd()); //使用随机设备作为种子
-  std::uniform_int_distribution<> dis(0, 255); // 0-255 的均匀分布
-
-  for (size_t i = 0; i < length; ++i) {
-    result.push_back(static_cast<char>(dis(gen)));
+struct CipherContextDeleter {
+  void operator()(EVP_CIPHER_CTX* context) const {
+    EVP_CIPHER_CTX_free(context);
   }
-  return result;
-}
-} // namespace
+};
 
+using CipherContext =
+    std::unique_ptr<EVP_CIPHER_CTX, CipherContextDeleter>;
+
+int HexDigitValue(char character) {
+  if (character >= '0' && character <= '9') {
+    return character - '0';
+  }
+  if (character >= 'a' && character <= 'f') {
+    return character - 'a' + 10;
+  }
+  if (character >= 'A' && character <= 'F') {
+    return character - 'A' + 10;
+  }
+  return -1;
+}
+
+bool DecodeMasterKey(const char* encoded,
+                     std::array<unsigned char, 32>& key) {
+  if (encoded == nullptr || std::char_traits<char>::length(encoded) != 64) {
+    return false;
+  }
+
+  for (size_t index = 0; index < key.size(); ++index) {
+    const int high = HexDigitValue(encoded[index * 2]);
+    const int low = HexDigitValue(encoded[index * 2 + 1]);
+    if (high < 0 || low < 0) {
+      return false;
+    }
+    key[index] = static_cast<unsigned char>((high << 4) | low);
+  }
+  return true;
+}
+
+}  // namespace
+
+AesEncrypt::AesEncrypt() {
+  const char* configured_key = std::getenv(kMasterKeyEnvironment);
+  if (configured_key != nullptr) {
+    key_initialized_ = DecodeMasterKey(configured_key, master_key_);
+    if (!key_initialized_) {
+      LOG_ERROR("{} must contain exactly 64 hexadecimal characters",
+                kMasterKeyEnvironment);
+    }
+    return;
+  }
+
+  // 未配置持久主密钥时生成进程级随机密钥，避免源码中出现硬编码密钥。
+  key_initialized_ =
+      RAND_bytes(master_key_.data(), static_cast<int>(master_key_.size())) == 1;
+  if (key_initialized_) {
+    LOG_WARN("{} is not set; using an ephemeral process-local encryption key",
+             kMasterKeyEnvironment);
+  } else {
+    LOG_ERROR("Failed to generate an AES-256 master key");
+  }
+}
+
+AesEncrypt::~AesEncrypt() {
+  OPENSSL_cleanse(master_key_.data(), master_key_.size());
+}
+
+// Base64 编码用于把二进制密文转换为便于传输和存储的文本。
 std::string AesEncrypt::Base64Encode(const std::string& input) const {
-  std::string ret;
-  int i = 0;
-  int j = 0;
-  unsigned char char_array_3[3]; // 存储 3 个原始字节
-  unsigned char char_array_4[4]; // 存储 4 个编码后的 6 位值
-
-  const unsigned char* bytes_to_encode =
-    reinterpret_cast<const unsigned char*>(input.data());
-  size_t in_len = input.length();
-
-  while (in_len--) {
-    char_array_3[i++] = *(bytes_to_encode++);
-    if (i == 3) {
-      // 将 3 个字节转换为 4 个 6 位值
-      char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-      char_array_4[1] = ((char_array_3[0] & 0x03) << 4) +
-                        ((char_array_3[1] & 0xf0) >> 4);
-      char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) +
-                        ((char_array_3[2] & 0xc0) >> 6);
-      char_array_4[3] = char_array_3[2] & 0x3f;
-
-      // 将 6 位值转换为 Base64 字符
-      for (i = 0; i < 4; ++i) {
-        ret += BASE64_CHARS[char_array_4[i]];
-      }
-      i = 0;
-    }
-  }
-
-  // 处理不足 3 位字节的剩余数据
-  if (i) {
-    // 用 '\0' 补齐到 3 字节
-    for (j = i; j < 3; ++j) {
-      char_array_3[j] = '\0';
-    }
-
-    // 转换为 6位值
-    char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-    char_array_4[1] = ((char_array_3[0] & 0x03) << 4) +
-                      ((char_array_3[1] & 0xf0) >> 4);
-    char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) +
-                      ((char_array_3[2] & 0xc0) >> 6);
-
-    // 只编码有效的部分
-    for (j = 0; j < i + 1; ++j) {
-      ret += BASE64_CHARS[char_array_4[j]];
-    }
-
-    // 用 '=' 填充到 4 的倍数
-    while ((i++ < 3)) {
-      ret += '=';
-    }
-  }
-  return ret;
-}
-
-std::string AesEncrypt::Base64Decode(const std::string& input) const {
-  std::string ret;
-  // 建立 Base64 字符到索引的映射表
-  std::vector<int> base64_map(256, -1);
-  for (size_t i = 0; i < BASE64_CHARS.size(); ++i) {
-    base64_map[BASE64_CHARS[i]] = i;
-  }
-
-  if (input.empty() || input.size() % 4 != 0) {
+  if (input.empty() || input.size() > static_cast<size_t>(INT_MAX)) {
     return {};
   }
 
-  std::size_t padding_size = 0;
+  std::string output(4 * ((input.size() + 2) / 3), '\0');
+  const int encoded_size = EVP_EncodeBlock(
+      reinterpret_cast<unsigned char*>(output.data()),
+      reinterpret_cast<const unsigned char*>(input.data()),
+      static_cast<int>(input.size()));
+  if (encoded_size <= 0) {
+    return {};
+  }
+  output.resize(static_cast<size_t>(encoded_size));
+  return output;
+}
+
+// Base64 解码先严格校验字符和尾部填充，再交给 OpenSSL 解码。
+std::string AesEncrypt::Base64Decode(const std::string& input) const {
+  if (input.empty() || input.size() % 4 != 0 ||
+      input.size() > static_cast<size_t>(INT_MAX)) {
+    return {};
+  }
+
+  size_t padding_size = 0;
   bool padding_started = false;
-  for (char character : input) {
+  for (const char character : input) {
     if (character == '=') {
       padding_started = true;
       ++padding_size;
       continue;
     }
-
-    const auto byte = static_cast<unsigned char>(character);
-    if (padding_started || base64_map[byte] < 0) {
+    if (padding_started ||
+        kBase64Characters.find(character) == std::string::npos) {
       return {};
     }
   }
@@ -117,145 +131,177 @@ std::string AesEncrypt::Base64Decode(const std::string& input) const {
     return {};
   }
 
-  size_t in_len = input.size();
-  int i = 0;
-  int j = 0;
-  int in_ = 0;
-  unsigned char char_array_3[3];
-  unsigned char char_array_4[4];
-
-  while (in_len-- && input[in_] != '=') {
-    char_array_4[i++] = input[in_];
-    in_++;
-    if (i == 4) {
-      // 将 Base64 字符转换为 6 位值
-      for (i = 0; i < 4; ++i) {
-        char_array_4[i] = base64_map[char_array_4[i]];
-      }
-
-      // 将 4 个 6 位值转换为 3 个 8 位字节
-      char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
-      char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-      char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
-
-      for (i = 0; i < 3; ++i) {
-        ret += char_array_3[i];
-      }
-      i = 0;
-    }
+  std::string output(3 * (input.size() / 4), '\0');
+  const int decoded_size = EVP_DecodeBlock(
+      reinterpret_cast<unsigned char*>(output.data()),
+      reinterpret_cast<const unsigned char*>(input.data()),
+      static_cast<int>(input.size()));
+  if (decoded_size < 0 ||
+      static_cast<size_t>(decoded_size) < padding_size) {
+    return {};
   }
-
-  // 处理剩余的字符
-  if (i) {
-    for (j = i; j < 4; ++j) {
-      char_array_4[j] = 0;
-    }
-
-    for (j = 0; j < 4; ++j) {
-      char_array_4[j] = base64_map[char_array_4[j]];
-    }
-
-    char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
-    char_array_3[1] = ((char_array_4[1] & 0xf) << 4) +
-                      ((char_array_4[2] & 0x3c) >> 2);
-    char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
-
-    // 只取有效的字节
-    for (j = 0; j < i - 1; ++j) {
-      ret += char_array_3[j];
-    }
-  }
-  return ret;
-}
-
-std::string AesEncrypt::ShiftEncrypt(const std::string& input, const std::string& key) const {
-  std::string result;
-  result.reserve(input.size());
-
-  for (size_t i = 0; i < input.size(); ++i) {
-    unsigned char c = input[i]; // 原始字符
-    unsigned char k = key[i % key.size()]; // 循环使用密钥
-    unsigned char shift = i % 256; // 位置相关的偏移量
-
-    result.push_back(static_cast<char>((c + k + shift) % 256));
-  }
-  return result;
-}
-
-std::string AesEncrypt::ShiftDecrypt(const std::string& input, const std::string& key) const {
-  std::string result;
-  result.reserve(input.size());
-
-  for (size_t i = 0; i < input.size(); ++i) {
-    unsigned char c = input[i]; // 原始字符
-    unsigned char k = key[i % key.size()]; // 循环使用密钥
-    unsigned char shift = i % 256; // 位置相关的偏移量
-
-    result.push_back(static_cast<char>((c - k - shift) % 256));
-  }
-  return result;
-}
-
-AesEncrypt::AesEncrypt() {
-  master_key_ = "CookRPC_Secret_Key_2024_Production!@#$%^&*";
+  output.resize(static_cast<size_t>(decoded_size) - padding_size);
+  return output;
 }
 
 bool AesEncrypt::Encrypt(const std::string& data, std::string& ciphertext) {
+  ciphertext.clear();
   try {
     // 输入验证
     if (data.empty()) {
       LOG_ERROR("Input data is empty");
       return false;
     }
-
-    // 生成随机会话密钥
-    std::string session_key = GenerateRandomBytes(KEY_LENGTH);
-
-    // 使用会话密钥加密实际数据
-    std::string encrypted = ShiftEncrypt(data, session_key);
-
-    // 使用主密钥加密会话密钥
-    std::string encrypted_key = ShiftEncrypt(session_key, master_key_);
-
-    // 组合加密后的密钥和数据
-    std::string combined = encrypted_key + encrypted;
-
-    // Base64 编码最终结果
-    ciphertext = Base64Encode(combined);
-
-    return true;
-  } catch (const std::exception& e) {
-    LOG_ERROR("Encrypion failed: {}", e.what());
-    return false;
-  }
-}
-
-bool AesEncrypt::Decrypt(const std::string& encrypted_data, std::string& plaintext) {
-  try {
-    // Base64 解码
-    std::string decoded = Base64Decode(encrypted_data);
-
-    // 验证数据长度
-    if (decoded.size() <= KEY_LENGTH) {
-      LOG_ERROR("Decoded data too short: {} bytes, need > {} bytes",
-                decoded.size(), KEY_LENGTH);
+    if (!key_initialized_ || data.size() > static_cast<size_t>(INT_MAX)) {
+      LOG_ERROR("AES-256-GCM encryption key or input is invalid");
       return false;
     }
 
-    // 分离加密的密钥和数据
-    std::string encrypted_key = decoded.substr(0, KEY_LENGTH); // 前 32 字节
-    std::string encrypted_data_part = decoded.substr(KEY_LENGTH);
+    std::array<unsigned char, NONCE_LENGTH> nonce{};
+    std::array<unsigned char, TAG_LENGTH> tag{};
+    if (RAND_bytes(nonce.data(), static_cast<int>(nonce.size())) != 1) {
+      LOG_ERROR("Failed to generate an AES-GCM nonce");
+      return false;
+    }
 
-    // 解密会话密钥
-    std::string session_key = ShiftDecrypt(encrypted_key, master_key_);
+    CipherContext context(EVP_CIPHER_CTX_new());
+    if (context == nullptr ||
+        EVP_EncryptInit_ex(context.get(), EVP_aes_256_gcm(), nullptr, nullptr,
+                           nullptr) != 1 ||
+        EVP_CIPHER_CTX_ctrl(context.get(), EVP_CTRL_GCM_SET_IVLEN,
+                            static_cast<int>(nonce.size()), nullptr) != 1 ||
+        EVP_EncryptInit_ex(context.get(), nullptr, nullptr, master_key_.data(),
+                           nonce.data()) != 1) {
+      LOG_ERROR("Failed to initialize AES-256-GCM encryption");
+      return false;
+    }
 
-    // 解密实际数据
-    plaintext = ShiftDecrypt(encrypted_data_part, session_key);
+    int output_size = 0;
+    int encrypted_size = 0;
+    if (EVP_EncryptUpdate(context.get(), nullptr, &output_size,
+                          &kCiphertextVersion, 1) != 1) {
+      LOG_ERROR("Failed to authenticate the ciphertext version");
+      return false;
+    }
 
-    return true;
-  } catch (const std::exception& e) {
-    LOG_ERROR("Decryption failed: {}", e.what());
+    std::string encrypted(data.size(), '\0');
+    if (EVP_EncryptUpdate(
+            context.get(),
+            reinterpret_cast<unsigned char*>(encrypted.data()), &output_size,
+            reinterpret_cast<const unsigned char*>(data.data()),
+            static_cast<int>(data.size())) != 1) {
+      LOG_ERROR("AES-256-GCM encryption failed");
+      return false;
+    }
+    encrypted_size = output_size;
+    if (EVP_EncryptFinal_ex(
+            context.get(),
+            reinterpret_cast<unsigned char*>(encrypted.data()) +
+                encrypted_size,
+            &output_size) != 1 ||
+        EVP_CIPHER_CTX_ctrl(context.get(), EVP_CTRL_GCM_GET_TAG,
+                            static_cast<int>(tag.size()), tag.data()) != 1) {
+      LOG_ERROR("Failed to finalize AES-256-GCM encryption");
+      return false;
+    }
+    encrypted_size += output_size;
+    encrypted.resize(static_cast<size_t>(encrypted_size));
+
+    // 密文格式：[版本][随机 nonce][密文][GCM 认证标签]。
+    std::string binary;
+    binary.reserve(1 + nonce.size() + encrypted.size() + tag.size());
+    binary.push_back(static_cast<char>(kCiphertextVersion));
+    binary.append(reinterpret_cast<const char*>(nonce.data()), nonce.size());
+    binary.append(encrypted);
+    binary.append(reinterpret_cast<const char*>(tag.data()), tag.size());
+    ciphertext = Base64Encode(binary);
+    return !ciphertext.empty();
+  } catch (const std::exception& error) {
+    ciphertext.clear();
+    LOG_ERROR("Encryption failed: {}", error.what());
     return false;
   }
 }
-} // namespace cookrpc
+
+bool AesEncrypt::Decrypt(const std::string& encrypted_data,
+                         std::string& plaintext) {
+  plaintext.clear();
+  try {
+    // Base64 解码
+    const std::string decoded = Base64Decode(encrypted_data);
+
+    // 验证版本以及 nonce、密文和认证标签的最小长度。
+    const size_t minimum_size = 1 + NONCE_LENGTH + 1 + TAG_LENGTH;
+    if (!key_initialized_ || decoded.size() < minimum_size ||
+        static_cast<unsigned char>(decoded.front()) != kCiphertextVersion) {
+      LOG_ERROR("Invalid AES-256-GCM ciphertext format");
+      return false;
+    }
+
+    const auto* nonce = reinterpret_cast<const unsigned char*>(
+        decoded.data() + 1);
+    const size_t encrypted_size =
+        decoded.size() - 1 - NONCE_LENGTH - TAG_LENGTH;
+    if (encrypted_size > static_cast<size_t>(INT_MAX)) {
+      LOG_ERROR("AES-256-GCM ciphertext is too large");
+      return false;
+    }
+    const auto* encrypted = reinterpret_cast<const unsigned char*>(
+        decoded.data() + 1 + NONCE_LENGTH);
+    const auto* tag = reinterpret_cast<const unsigned char*>(
+        decoded.data() + decoded.size() - TAG_LENGTH);
+
+    CipherContext context(EVP_CIPHER_CTX_new());
+    if (context == nullptr ||
+        EVP_DecryptInit_ex(context.get(), EVP_aes_256_gcm(), nullptr, nullptr,
+                           nullptr) != 1 ||
+        EVP_CIPHER_CTX_ctrl(context.get(), EVP_CTRL_GCM_SET_IVLEN,
+                            static_cast<int>(NONCE_LENGTH), nullptr) != 1 ||
+        EVP_DecryptInit_ex(context.get(), nullptr, nullptr, master_key_.data(),
+                           nonce) != 1) {
+      LOG_ERROR("Failed to initialize AES-256-GCM decryption");
+      return false;
+    }
+
+    int output_size = 0;
+    int plaintext_size = 0;
+    if (EVP_DecryptUpdate(context.get(), nullptr, &output_size,
+                          &kCiphertextVersion, 1) != 1) {
+      LOG_ERROR("Failed to authenticate the ciphertext version");
+      return false;
+    }
+
+    plaintext.resize(encrypted_size);
+    if (EVP_DecryptUpdate(
+            context.get(),
+            reinterpret_cast<unsigned char*>(plaintext.data()), &output_size,
+            encrypted, static_cast<int>(encrypted_size)) != 1) {
+      plaintext.clear();
+      LOG_ERROR("AES-256-GCM decryption failed");
+      return false;
+    }
+    plaintext_size = output_size;
+
+    if (EVP_CIPHER_CTX_ctrl(
+            context.get(), EVP_CTRL_GCM_SET_TAG, static_cast<int>(TAG_LENGTH),
+            const_cast<unsigned char*>(tag)) != 1 ||
+        EVP_DecryptFinal_ex(
+            context.get(),
+            reinterpret_cast<unsigned char*>(plaintext.data()) +
+                plaintext_size,
+            &output_size) != 1) {
+      plaintext.clear();
+      LOG_WARN("AES-256-GCM authentication failed");
+      return false;
+    }
+
+    plaintext_size += output_size;
+    plaintext.resize(static_cast<size_t>(plaintext_size));
+    return true;
+  } catch (const std::exception& error) {
+    plaintext.clear();
+    LOG_ERROR("Decryption failed: {}", error.what());
+    return false;
+  }
+}
+}  // namespace cookrpc

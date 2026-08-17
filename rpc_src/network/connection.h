@@ -1,8 +1,11 @@
-#include <atomic>
+#ifndef RPC_TUTORIAL_RPC_SRC_NETWORK_CONNECTION_H_
+#define RPC_TUTORIAL_RPC_SRC_NETWORK_CONNECTION_H_
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -33,14 +36,16 @@ class Connection : public std::enable_shared_from_this<Connection> {
   bool Write(const std::string& data);
   bool Write(const RpcResponse& response);
   void Close();
-  bool IsValid() const { 
-    return fd_ > 0 && state_ == State::CONNECTED; 
+  bool IsValid() const {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    return fd_ >= 0 && state_ == State::CONNECTED;
   }
   bool ReadWithTimeout(int timeout_ms);
 
   // 获取连接信息
-  int GetFd() const { 
-    return fd_; 
+  int GetFd() const {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    return fd_;
   }
   const std::string& GetPeerAddress() const { 
     return peer_addr_; 
@@ -48,23 +53,27 @@ class Connection : public std::enable_shared_from_this<Connection> {
   uint16_t GetPeerPort() const { 
     return peer_port_; 
   }
-  State GetState() const { 
-    return state_; 
+  State GetState() const {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    return state_;
   }
 
   // 获取读缓冲区数据（客户端使用）
   std::string GetReadBufferData() {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     std::string data(read_buffer_.begin(), read_buffer_.end());
     read_buffer_.clear(); // 清空缓冲区
     return data;
   }
 
   // 设置回调
-  void SetMessageCallback(const MessageCallback& cb) { 
-    message_callback_ = cb; 
+  void SetMessageCallback(const MessageCallback& cb) {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    message_callback_ = cb;
   }
-  void SetCloseCallback(const CloseCallback& cb) { 
-    close_callback_ = cb; 
+  void SetCloseCallback(const CloseCallback& cb) {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    close_callback_ = cb;
   }
 
   static const size_t MAX_MESSAGE_SIZE = 1024 * 1024; // 1MB
@@ -87,6 +96,9 @@ class Connection : public std::enable_shared_from_this<Connection> {
   static const size_t MAX_BUFFER_SIZE = 65536;
 
   State state_ = State::DISCONNECTED;
-  std::atomic<bool> is_writing_ = false;
+  // 统一保护套接字生命周期和读写缓冲区，允许错误处理递归进入 Close。
+  mutable std::recursive_mutex io_mutex_;
 };
 } // namespace cookrpc
+
+#endif  // RPC_TUTORIAL_RPC_SRC_NETWORK_CONNECTION_H_

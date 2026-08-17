@@ -12,6 +12,7 @@
 #include <string>
 
 #include "log_manager.h"
+#include "service_manager.h"
 #include "thread_pool_singleton.h"
 
 namespace cookrpc {
@@ -49,12 +50,29 @@ void ProcessRpcRequest(const std::shared_ptr<Connection>& connection,
 
   RpcResponse response;
   response.SetSequenceId(request.GetSequenceId());
-  const ErrorCode error_code = ValidateRpcRequest(request);
-  response.SetErrorCode(static_cast<uint32_t>(error_code));
+  ErrorCode error_code = ValidateRpcRequest(request);
   if (error_code == ErrorCode::kSuccess) {
-    // 项目尚未提供服务方法分发器；网络层先以载荷回显形成完整 RPC 链路。
-    response.SetResultData(request.GetPayload());
-  } else {
+    ServiceManager& service_manager = ServiceManager::GetInstance();
+    if (service_manager.GetService(request.GetServiceName()) == nullptr) {
+      error_code = ErrorCode::kServiceNotFound;
+    } else {
+      std::string result;
+      // 通过服务管理器执行实际业务方法，避免网络层绕过已注册服务。
+      if (service_manager.HandleRpcRequest(
+              request.GetServiceName(), request.GetMethodName(),
+              request.GetPayload(), result)) {
+        response.SetResultData(result);
+      } else {
+        error_code = ErrorCode::kBusinessError;
+        response.SetErrorMessage(
+            result.empty() ? Error::GetErrorMessage(error_code) : result);
+      }
+    }
+  }
+
+  response.SetErrorCode(static_cast<uint32_t>(error_code));
+  if (error_code != ErrorCode::kSuccess &&
+      response.GetErrorMessage().empty()) {
     response.SetErrorMessage(Error::GetErrorMessage(error_code));
   }
 

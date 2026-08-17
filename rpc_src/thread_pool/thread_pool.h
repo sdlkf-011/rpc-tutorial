@@ -38,7 +38,7 @@ enum class ThreadPoolState {
 // 线程池运行参数
 struct ThreadPoolStruct {
   size_t core_threads = std::thread::hardware_concurrency(); // 核心线程数
-  size_t max_threads = std::thread::hardware_concurrency() * 2; // 最大核心线程数
+  size_t max_threads = std::thread::hardware_concurrency() * 2; // 最大线程数
   size_t max_queue_size = 1000; // 最大队列大小
   std::chrono::milliseconds keep_alive_time{60000}; // 非核心线程空闲超时时间
 };
@@ -77,7 +77,7 @@ class ThreadPool {
     size_t tasks_completed = 0; // 已完成任务数
     size_t tasks_failed = 0; // 失败任务数
     double avg_task_time_ms = 0; // 平均任务执行时间
-    size_t active_threads = 0; // 平均任务执行时间
+    size_t active_threads = 0; // 当前活跃线程数
   };
 
   explicit ThreadPool(size_t threads = std::thread::hardware_concurrency());
@@ -94,7 +94,7 @@ class ThreadPool {
   Stats GetStats() const;
 
   size_t Size() const noexcept {
-    return workers_.size();
+    return current_threads_.load();
   }
 
   size_t QueueSize() const noexcept;
@@ -125,7 +125,6 @@ class ThreadPool {
   mutable std::mutex queue_mutex_;  // 保护任务队列和停止标志
   mutable std::mutex lifecycle_mutex_;  // 串行化关闭和销毁
   std::condition_variable condition_; // 任务可用条件变量
-  std::condition_variable not_full_condition_; // 队列非满条件变量
   bool stop_{false}; // 停止标志
 
   std::atomic<ThreadPoolState> state_{ThreadPoolState::kRunning}; // 线程池状态
@@ -153,14 +152,10 @@ auto ThreadPool::Enqueue(TaskPriority priority, F&& f, Args&&... args)
     }
 
     if (config_.max_queue_size > 0) {
-      not_full_condition_.wait(lock, [this] {
-        return stop_ || tasks_.size() < config_.max_queue_size;
-      });
-    }
-
-    if (stop_ || state_ == ThreadPoolState::kStopped ||
-        state_ == ThreadPoolState::kShuttingDown) {
-      return {};
+      // 队列满时立即拒绝任务，由调用方执行背压或返回服务不可用。
+      if (tasks_.size() >= config_.max_queue_size) {
+        return {};
+      }
     }
 
     tasks_.emplace([task] { (*task)(); }, priority);
@@ -168,10 +163,10 @@ auto ThreadPool::Enqueue(TaskPriority priority, F&& f, Args&&... args)
         priority == TaskPriority::kHigh
             ? "HIGH"
             : priority == TaskPriority::kNormal ? "NORMAL" : "LOW";
-    LOG_INFO("[ThreadPool] Enqueuing task with priority: {}, current queue "
-             "size: {}/{}, active threads: {}/{}",
-             priority_string, tasks_.size(), config_.max_queue_size,
-             active_threads_.load(), current_threads_.load());
+    LOG_DEBUG("[ThreadPool] Enqueuing task with priority: {}, current queue "
+              "size: {}/{}, active threads: {}/{}",
+              priority_string, tasks_.size(), config_.max_queue_size,
+              active_threads_.load(), current_threads_.load());
 
     if (tasks_.size() > active_threads_ &&
         current_threads_ < config_.max_threads) {

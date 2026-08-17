@@ -14,17 +14,19 @@
 - Linux（代码使用 POSIX socket、`epoll` 和 pthread API）。
 - CMake 3.20 或更高版本。
 - 支持 C++17 的编译器（GCC 9+ 或 Clang 10+）。
-- Protobuf、fmt、spdlog、nlohmann-json、zstd、ZooKeeper C client 和 GoogleTest（测试需要）。
+- OpenSSL、Protobuf、fmt、spdlog、nlohmann-json、zstd、ZooKeeper C client 和 GoogleTest（测试需要）。
 - 正常运行 RPC 服务需要 ZooKeeper 服务端，默认地址为 `localhost:2181`。
 
 项目使用 vcpkg 的 CMake config package。安装依赖后设置 `VCPKG_ROOT`，例如：
 
 ```bash
 export VCPKG_ROOT=/path/to/vcpkg
-${VCPKG_ROOT}/vcpkg install protobuf fmt spdlog nlohmann-json zstd zookeeper[sync] gtest
+${VCPKG_ROOT}/vcpkg install openssl protobuf fmt spdlog nlohmann-json zstd zookeeper[sync] gtest
 ```
 
 其中 `zookeeper[sync]` 特性是必须的，因为服务注册使用 ZooKeeper 同步 API。
+
+加密模块使用 OpenSSL AES-256-GCM。生产环境应通过 64 位十六进制字符串环境变量 `COOKRPC_MASTER_KEY_HEX` 提供 32 字节主密钥；未设置时会生成仅在当前进程生命周期内有效的随机密钥。
 
 ## 构建
 
@@ -79,7 +81,23 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-当前测试覆盖负载均衡、序列化、RPC 协议、服务管理、AES 加密和 Zstd 压缩。
+当前测试覆盖负载均衡、序列化、RPC 协议、服务管理、线程池背压、AES 加密和 Zstd 压缩。
+
+## 压力测试
+
+压力测试使用多个独立长连接并发调用 `RpcService.Echo`，输出成功率、吞吐量以及平均、P50、P95、P99 和最大延迟。运行前需要启动 ZooKeeper，并确保客户端配置对应的服务已经注册：
+
+```bash
+./stress_test.sh --threads 8 --requests 50000 --payload-size 256
+```
+
+如果需要由脚本临时启动并在结束时关闭本地服务端，可以使用：
+
+```bash
+./stress_test.sh --start-server --threads 8 --requests 50000
+```
+
+使用 `--build` 可在压测前重新构建。执行 `./stress_test.sh --help` 可以查看所有参数及对应的环境变量。
 
 ## 头文件引用规则
 
