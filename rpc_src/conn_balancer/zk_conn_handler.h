@@ -22,7 +22,7 @@ extern "C"
 }
 #endif
 
-#include "registry/service_registry.h"
+#include "service_registry.h"
 
 // 前置声明
 class LoadBalancer;

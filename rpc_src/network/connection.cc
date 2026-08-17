@@ -1,4 +1,4 @@
-#include "network/connection.h"
+#include "connection.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>

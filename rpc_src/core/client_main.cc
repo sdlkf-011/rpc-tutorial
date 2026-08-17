@@ -3,7 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "core/rpc_client.h"
+#include "rpc_client.h"
 #include "log_manager.h"
 
 namespace {

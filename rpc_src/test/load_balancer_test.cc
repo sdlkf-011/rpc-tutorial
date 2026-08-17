@@ -5,10 +5,10 @@
 #include <string>
 #include <vector>
 
-#include "conn_balancer/load_balancer.h"
-#include "conn_balancer/random.h"
-#include "conn_balancer/round.h"
-#include "conn_balancer/weight.h"
+#include "load_balancer.h"
+#include "random.h"
+#include "round.h"
+#include "weight.h"
 
 namespace cookrpc {
 namespace {

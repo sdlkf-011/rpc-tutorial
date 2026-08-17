@@ -17,8 +17,8 @@
 #include <zookeeper/zookeeper.jute.h>
 
 #include "log_manager.h"
-#include "load_config/registry_config.h"
-#include "conn_balancer/load_balancer.h"
+#include "registry_config.h"
+#include "load_balancer.h"
 
 namespace cookrpc {
 

@@ -6,8 +6,8 @@
 #include <string>
 #include <utility>
 
-#include "service/service_manager.h"
-#include "thread_pool/thread_pool_singleton.h"
+#include "service_manager.h"
+#include "thread_pool_singleton.h"
 
 namespace cookrpc {
 namespace {

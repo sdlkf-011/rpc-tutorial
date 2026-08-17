@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string>
 
-#include "protocol/rpc_protocol.h"
+#include "rpc_protocol.h"
 
 namespace cookrpc {
 namespace {

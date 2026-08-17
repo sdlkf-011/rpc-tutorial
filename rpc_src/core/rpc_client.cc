@@ -1,4 +1,4 @@
-#include "core/rpc_client.h"
+#include "rpc_client.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -21,8 +21,8 @@
 
 #include <nlohmann/json.hpp>
 
-#include "conn_balancer/load_balancer.h"
-#include "conn_balancer/zk_conn_handler.h"
+#include "load_balancer.h"
+#include "zk_conn_handler.h"
 
 namespace cookrpc {
 namespace {

@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "encrypt/aes_encrypt.h"
+#include "aes_encrypt.h"
 
 namespace cookrpc {
 namespace {

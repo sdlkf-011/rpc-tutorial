@@ -18,8 +18,8 @@
 #endif
 
 #include "connection_manager.h"
-#include "core/error_code.h"
-#include "protocol/rpc_protocol.h"
+#include "error_code.h"
+#include "rpc_protocol.h"
 
 namespace cookrpc {
   
