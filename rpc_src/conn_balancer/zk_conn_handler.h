@@ -63,20 +63,23 @@ class ZkConnHandler {
   bool ReisterServicesFromConfig(const cookrpc::ServiceRegistryConfig* registry_config);
 
   // 获取 ServiceRegistry 实例
-  ServiceRegistry* GetServiceRegistry() {
-    return service_registry_.get();
+  std::shared_ptr<ServiceRegistry> GetServiceRegistry() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return service_registry_;
   }
 
-  const ServiceRegistry* GetServiceRegistry() const {
-    return service_registry_.get();
+  std::shared_ptr<const ServiceRegistry> GetServiceRegistry() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return service_registry_;
   }
 
   bool HasServiceRegistry() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return service_registry_ != nullptr;
   }
 
   // 获取或创建 ServiceRegistry 实例
-  ServiceRegistry* GetOrCreateServiceRegistry();
+  std::shared_ptr<ServiceRegistry> GetOrCreateServiceRegistry();
 
   // 配置设置
   void SetZkHost(const std::string& host);
@@ -111,7 +114,7 @@ class ZkConnHandler {
   std::atomic<bool> running_; // 运行状态
   std::chrono::seconds retry_interval_; // 重试间隔
 
-  std::mutex mutex_; // 保护成员变量访问
+  mutable std::mutex mutex_; // 保护成员变量和 ZooKeeper 客户端生命周期
   std::mutex servers_mutex_; // 保护服务器列表
   std::vector<std::string> servers_; // 缓存的服务器列表
 
@@ -122,7 +125,7 @@ class ZkConnHandler {
   int zk_port_; // Zookeeper 端口
   std::string zk_namespace_; // 命名空间
 
-  std::unique_ptr<ServiceRegistry> service_registry_; // ServiceRegistry实例
+  std::shared_ptr<ServiceRegistry> service_registry_; // ServiceRegistry实例
 };
 } // namespace cookrpc
 

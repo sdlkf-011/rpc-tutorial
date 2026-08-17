@@ -1,6 +1,7 @@
 #ifndef RPC_TUTORIAL_RPC_SRC_ENCRYPT_AES_ENCRYPT_H_
 #define RPC_TUTORIAL_RPC_SRC_ENCRYPT_AES_ENCRYPT_H_
 
+#include <array>
 #include <cstddef>
 #include <string>
 
@@ -23,22 +24,17 @@ class AesEncrypt {
   AesEncrypt& operator=(const AesEncrypt&) = delete;
  private:
   AesEncrypt();
-  ~AesEncrypt() = default;
+  ~AesEncrypt();
 
   // Base64 编解码
   std::string Base64Encode(const std::string& input) const;
   std::string Base64Decode(const std::string& input) const;
 
-  // 移位加密/解密算法
-  std::string ShiftEncrypt(const std::string& input, const std::string& key) const;
-  std::string ShiftDecrypt(const std::string& input, const std::string& key) const;
-
-  // 生成随机密钥(测试用)
-  std::string GenerateKey() const;
-
-  std::string master_key_; // 主密钥
-  static constexpr size_t KEY_LENGTH = 32; // 会话密钥长度
-  static constexpr size_t BLOCK_SIZE = 16; // 加密块大小
+  static constexpr size_t KEY_LENGTH = 32; // AES-256 密钥长度
+  std::array<unsigned char, KEY_LENGTH> master_key_{}; // AES-256 主密钥
+  bool key_initialized_ = false;
+  static constexpr size_t NONCE_LENGTH = 12; // GCM 推荐随机 nonce 长度
+  static constexpr size_t TAG_LENGTH = 16; // GCM 认证标签长度
 };
 } // namespace cookrpc
 

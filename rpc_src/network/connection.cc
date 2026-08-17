@@ -81,6 +81,7 @@ Connection::Connection(int fd) : fd_(fd) {
 }
 
 Connection::~Connection() {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
   if (fd_ >= 0) {
     shutdown(fd_, SHUT_RDWR);
     close(fd_);
@@ -90,6 +91,7 @@ Connection::~Connection() {
 }
 
 bool Connection::Read() {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
   if (!IsValid()) {
     return false;
   }
@@ -131,6 +133,7 @@ bool Connection::Read() {
 }
 
 bool Connection::ReadWithTimeout(int timeout_ms) {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
   if (!IsValid() || timeout_ms < 0) {
     return false;
   }
@@ -154,35 +157,22 @@ bool Connection::ReadWithTimeout(int timeout_ms) {
 }
 
 bool Connection::Write(const std::string& data) {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
   if (data.empty()) {
     return IsValid();
   }
 
-  bool expected = false;
-  while (!is_writing_.compare_exchange_weak(expected, true,
-                                             std::memory_order_acquire)) {
-    if (!IsValid()) {
-      return false;
-    }
-    expected = false;
-    std::this_thread::yield();
-  }
-
   if (!IsValid()) {
-    is_writing_.store(false, std::memory_order_release);
     return false;
   }
   try {
     write_buffer_.insert(write_buffer_.end(), data.begin(), data.end());
   } catch (...) {
-    is_writing_.store(false, std::memory_order_release);
     LOG_ERROR("Failed to buffer outgoing data for {}:{}", peer_addr_,
               peer_port_);
     return false;
   }
-  const bool succeeded = SendInBuffer();
-  is_writing_.store(false, std::memory_order_release);
-  return succeeded;
+  return SendInBuffer();
 }
 
 bool Connection::Write(const RpcResponse& response) {
@@ -281,6 +271,7 @@ void Connection::HandleError() {
 }
 
 void Connection::Close() {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
   if (state_ == State::DISCONNECTED || state_ == State::DISCONNECTING) {
     return;
   }

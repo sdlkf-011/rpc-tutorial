@@ -10,6 +10,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # 查找依赖库
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_package(Protobuf CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
@@ -84,6 +85,7 @@ target_include_directories(rpc_common
 target_link_libraries(rpc_common
   PUBLIC
     Threads::Threads
+    OpenSSL::Crypto
     protobuf::libprotobuf
     fmt::fmt
     spdlog::spdlog
@@ -172,6 +174,10 @@ if(BUILD_TESTING)
     rpc_src/test/service_test.cc
   )
 
+  add_executable(thread_pool_test
+    rpc_src/test/thread_pool_test.cc
+  )
+
   target_link_libraries(load_balancer_test
     PRIVATE
       rpc_common
@@ -196,8 +202,15 @@ if(BUILD_TESTING)
       GTest::gtest_main
   )
 
+  target_link_libraries(thread_pool_test
+    PRIVATE
+      rpc_common
+      GTest::gtest_main
+  )
+
   enable_project_warnings(load_balancer_test)
   enable_project_warnings(service_test)
+  enable_project_warnings(thread_pool_test)
 
   add_executable(aes_encrypt_test
     rpc_src/test/aes_encrypt_test.cc
@@ -229,4 +242,5 @@ if(BUILD_TESTING)
   gtest_discover_tests(zstd_compress_test)
   gtest_discover_tests(aes_encrypt_test)
   gtest_discover_tests(service_test)
+  gtest_discover_tests(thread_pool_test)
 endif()

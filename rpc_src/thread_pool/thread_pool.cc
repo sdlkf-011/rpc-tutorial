@@ -108,12 +108,9 @@ void ThreadPool::WorkerThread() {
       task = std::move(const_cast<TaskWrapper&>(tasks_.top()));
       tasks_.pop();
 
-      if (config_.max_queue_size > 0) {
-        not_full_condition_.notify_one();
-      }
-
-      LOG_INFO("[ThreadPool] Thread {} picked up task, queue size: {}, "
-               "active threads: {}", thread_id, tasks_.size(), active_threads_.load());
+      LOG_DEBUG("[ThreadPool] Thread {} picked up task, queue size: {}, "
+                "active threads: {}", thread_id, tasks_.size(),
+                active_threads_.load());
     }
 
     if (!task.Valid()) {
@@ -151,8 +148,8 @@ void ThreadPool::WorkerThread() {
 
     active_threads_.fetch_sub(1);
 
-    LOG_INFO("[ThreadPool] Thread {} completed task in {} ms", thread_id,
-             duration_ms);
+    LOG_DEBUG("[ThreadPool] Thread {} completed task in {} ms", thread_id,
+              duration_ms);
 
     condition_.notify_all();
   }
@@ -217,6 +214,7 @@ bool ThreadPool::ShutDown(std::chrono::milliseconds wait_timeout_ms) {
     if (state_ == ThreadPoolState::kStopped) {
       lifecycle_lock.unlock();
       JoinWorkers(&workers_);
+      current_threads_.store(0);
       return true;
     }
     state_ = ThreadPoolState::kShuttingDown;
@@ -243,10 +241,10 @@ bool ThreadPool::ShutDown(std::chrono::milliseconds wait_timeout_ms) {
 
   state_ = ThreadPoolState::kStopped;
   condition_.notify_all();
-  not_full_condition_.notify_all();
   lock.unlock();
 
   JoinWorkers(&workers_);
+  current_threads_.store(0);
   return completed;
 }
 
@@ -260,9 +258,9 @@ void ThreadPool::Stop() {
       tasks_.pop();
     }
     condition_.notify_all();
-    not_full_condition_.notify_all();
   }
   JoinWorkers(&workers_);
+  current_threads_.store(0);
 }
 
 ThreadPoolState ThreadPool::GetState() const noexcept {

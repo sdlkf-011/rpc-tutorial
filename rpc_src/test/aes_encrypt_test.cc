@@ -56,7 +56,7 @@ TEST(AesEncryptTest, RoundTripsTextPayloads) {
 TEST(AesEncryptTest, RoundTripsBinaryPayload) {
   std::string payload;
   payload.reserve(512);
-  // 连续写入两轮全部字节值，覆盖空字节、最高位字节及密钥循环使用。
+  // 连续写入两轮全部字节值，覆盖空字节和最高位字节。
   for (std::size_t index = 0; index < 512; ++index) {
     payload.push_back(static_cast<char>(index % 256));
   }
@@ -79,7 +79,7 @@ TEST(AesEncryptTest, ProducesIndependentCiphertexts) {
   ASSERT_TRUE(encryptor.Encrypt(payload, first_ciphertext));
   ASSERT_TRUE(encryptor.Encrypt(payload, second_ciphertext));
 
-  // 每次加密都应使用独立会话密钥，避免相同明文产生可预测密文。
+  // 每次加密都应使用独立随机 nonce，避免相同明文产生相同密文。
   EXPECT_NE(first_ciphertext, second_ciphertext);
 
   std::string first_plaintext;
@@ -88,6 +88,21 @@ TEST(AesEncryptTest, ProducesIndependentCiphertexts) {
   ASSERT_TRUE(encryptor.Decrypt(second_ciphertext, second_plaintext));
   EXPECT_EQ(first_plaintext, payload);
   EXPECT_EQ(second_plaintext, payload);
+}
+
+TEST(AesEncryptTest, RejectsTamperedCiphertext) {
+  std::string ciphertext;
+  AesEncrypt& encryptor = AesEncrypt::GetInstance();
+  ASSERT_TRUE(encryptor.Encrypt("authenticated payload", ciphertext));
+  ASSERT_GT(ciphertext.size(), 8U);
+
+  const size_t changed_index = ciphertext.size() / 2;
+  ciphertext[changed_index] =
+      ciphertext[changed_index] == 'A' ? 'B' : 'A';
+  std::string plaintext = "stale plaintext";
+
+  EXPECT_FALSE(encryptor.Decrypt(ciphertext, plaintext));
+  EXPECT_TRUE(plaintext.empty());
 }
 
 TEST(AesEncryptTest, ProducesBase64Ciphertext) {

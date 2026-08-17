@@ -32,7 +32,7 @@ bool ZkConnHandler::InitZkConnHandler(const nlohmann::json& config) {
   
     // 安全的读取参数配置
     try {
-      std::string zk_host = config.value("zk_host", "loaclhost");
+      std::string zk_host = config.value("zk_host", "localhost");
       SetZkHost(zk_host);
 
       int zk_port = config.value("zk_port", 2181);
@@ -48,11 +48,6 @@ bool ZkConnHandler::InitZkConnHandler(const nlohmann::json& config) {
 
     // 尝试建立连接
     bool is_connected = EnsureZkConnection();
-
-    if (!zk_client_) {
-      LOG_ERROR("Failed to initialize ZooKeeper client: {}", strerror(errno));
-      return false;
-    }
 
     if (!is_connected) {
       LOG_ERROR("Failed to connect to ZooKeeper after retries");
@@ -74,7 +69,11 @@ std::vector<std::string> ZkConnHandler::GetAllServers(const std::string& zk_name
     return {};
   }
 
-  std::lock_guard<std::mutex> lock(servers_mutex_);
+  // 保护客户端句柄，避免清理期间继续访问旧句柄。
+  std::lock_guard<std::mutex> client_lock(mutex_);
+  if (zk_client_ == nullptr) {
+    return {};
+  }
 
   try {
     struct String_vector children = {0, nullptr};
@@ -134,7 +133,8 @@ bool ZkConnHandler::RegisterService(const std::string& service_name,
                                     const std::string& service_address) {
   try {
     // 获取或创建 ServiceRegistry 实例
-    ServiceRegistry* registry = GetOrCreateServiceRegistry();
+    const std::shared_ptr<ServiceRegistry> registry =
+        GetOrCreateServiceRegistry();
     if (!registry) {
       LOG_ERROR("Failed to get or create ServiceRegistry for service registration");
       return false;
@@ -162,7 +162,8 @@ bool ZkConnHandler::ReisterServicesFromConfig(const cookrpc::ServiceRegistryConf
 
   try {
     // 获取或创建 ServiceRegistry 实例
-    ServiceRegistry* registry = GetOrCreateServiceRegistry();
+    const std::shared_ptr<ServiceRegistry> registry =
+        GetOrCreateServiceRegistry();
     if (!registry) {
       LOG_ERROR("Failed to get or create ServiceRegistry for batch service registration");
       return false;
@@ -190,18 +191,14 @@ bool ZkConnHandler::ReisterServicesFromConfig(const cookrpc::ServiceRegistryConf
   }
 }
 
-ServiceRegistry* ZkConnHandler::GetOrCreateServiceRegistry() {
-  // 无锁检查
+std::shared_ptr<ServiceRegistry> ZkConnHandler::GetOrCreateServiceRegistry() {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!service_registry_) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    // 有锁检查
-    if (!service_registry_) {
-      if (!CreateServiceRegistryIfNeeded()) {
-        return nullptr;
-      }
+    if (!CreateServiceRegistryIfNeeded()) {
+      return nullptr;
     }
   }
-  return service_registry_.get();
+  return service_registry_;
 }
 
 void ZkConnHandler::SetZkHost(const std::string& host) {
@@ -225,10 +222,12 @@ void ZkConnHandler::SetZkPort(int port) {
 }
 
 void ZkConnHandler::SetZkRetryInterval(int seconds) {
+  std::lock_guard<std::mutex> lock(mutex_);
   retry_interval_ = std::chrono::seconds(seconds);
 }
 
 void ZkConnHandler::SetZkNamespace(const std::string& zk_namespace) {
+  std::lock_guard<std::mutex> lock(mutex_);
   zk_namespace_ = zk_namespace;
 }
 
@@ -243,7 +242,14 @@ bool ZkConnHandler::EnsureZkConnection() {
   const int max_retries = 3;
 
   while (retry_count++ < max_retries) {
-    int state = zoo_state(zk_client_);
+    int state = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (zk_client_ == nullptr) {
+        return false;
+      }
+      state = zoo_state(zk_client_);
+    }
     const char* state_desc;
 
     // 状态描述
@@ -261,13 +267,22 @@ bool ZkConnHandler::EnsureZkConnection() {
       state_desc = "UNKNOWN";
       // 诊断信息
       LOG_WARN("Unexpected state value: {} (0x{:x})", state, state);
-      LOG_WARN("Client handle valid: {}", (zk_client_ != nullptr));
+      bool client_valid = false;
+      int exists_result = ZINVALIDSTATE;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        client_valid = zk_client_ != nullptr;
+        if (client_valid) {
+          // 尝试一个简单的操作测试连接
+          struct Stat stat{};
+          exists_result = zoo_exists(zk_client_, "/", 0, &stat);
+        }
+      }
+      LOG_WARN("Client handle valid: {}", client_valid);
 
-      if (zk_client_) {
-        // 尝试一个简单的操作测试连接
-        struct Stat stat{};
-        int rc = zoo_exists(zk_client_, "/", 0, &stat);
-        LOG_WARN("zoo_exists test result: {}", rc);
+      if (client_valid) {
+        // 记录连接探测结果，便于诊断 ZooKeeper 状态转换。
+        LOG_WARN("zoo_exists test result: {}", exists_result);
       }
     }
 
@@ -303,11 +318,7 @@ void ZkConnHandler::UpdateServersFromZk(const std::string& zk_namespace) {
 }
 
 void ZkConnHandler::CleanUp() {
-  // 通过原子标志确保在多线程环境中清理操作只被执行一次
-  static std::atomic<bool> cleanup_done{false};
-  if (cleanup_done.exchange(true)) {
-    return;
-  }
+  std::lock_guard<std::mutex> lock(mutex_);
 
   // 清理 ServiceRegistry 实例
   service_registry_.reset();
@@ -372,7 +383,7 @@ bool ZkConnHandler::CreateServiceRegistryIfNeeded() {
     std::string zk_connection = zk_host_ + ":" + std::to_string(zk_port_);
 
     // 创建 ServiceRegistry 实例
-    service_registry_ = std::make_unique<ServiceRegistry>(zk_connection);
+    service_registry_ = std::make_shared<ServiceRegistry>(zk_connection);
 
     // 等待连接创建
     std::this_thread::sleep_for(std::chrono::seconds(1));
