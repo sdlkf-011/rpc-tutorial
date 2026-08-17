@@ -11,46 +11,37 @@
 
 namespace cookrpc {
 
+// 示例 RPC 服务，用于验证服务注册和方法分发链路。
 class RpcService : public Service {
  public:
-  std::string GetServiceName() const override {
-    return "RpcService";
-  }
+  std::string GetServiceName() const override { return "RpcService"; }
 
   bool HandleRequest(const std::string& method_name, const std::string& args,
                      std::string& result) override {
-    if (method_name == "Echo") {
-      // 解析请求参数
-      try {
-        const nlohmann::json request = nlohmann::json::parse(args);
-
-        // 创建JSON响应
-        nlohmann::json response;
-        response["echo"] =
-            "hahah i am rpc server, welcome to C++ training camp, come on";
-        response["received_message"] = request.value("message", "");
-
-        // 序列化为字符串返回
-        result = response.dump();
-        return true;
-      } catch (const std::exception& e) {
-        LOG_ERROR("Failed to process Echo request: {}", e.what());
-
-        // 返回错误的 JSON 响应
-        nlohmann::json error_response;
-        error_response["error"] = "Invalid request format";
-        result = error_response.dump();
-        return false;
-      }
+    // 当前示例仅开放 Echo，未知方法返回结构化错误信息。
+    if (method_name != "Echo") {
+      LOG_ERROR("Unknown RpcService method: {}", method_name);
+      result = nlohmann::json{{"error", "Unknown method"}}.dump();
+      return false;
     }
 
-    LOG_ERROR("Unknown method: {}", method_name);
-    nlohmann::json error_response;
-    error_response["error"] = "Unknown method";
-    result = error_response.dump();
-    return false;
+    // 先完成 JSON 解析，再一次性生成结果。
+    // 避免返回部分响应。
+    try {
+      const nlohmann::json request = nlohmann::json::parse(args);
+      result = nlohmann::json{
+          {"echo", "Hello from cookrpc"},
+          {"received_message", request.value("message", "")},
+      }.dump();
+      return true;
+    } catch (const std::exception& error) {
+      LOG_ERROR("Failed to process Echo request: {}", error.what());
+      result = nlohmann::json{{"error", "Invalid request format"}}.dump();
+      return false;
+    }
   }
 };
-} // namespace cookrpc
 
-#endif // RPC_TUTORIAL_RPC_SRC_CORE_RPC_SERVICE_H_
+}  // namespace cookrpc
+
+#endif  // RPC_TUTORIAL_RPC_SRC_CORE_RPC_SERVICE_H_
