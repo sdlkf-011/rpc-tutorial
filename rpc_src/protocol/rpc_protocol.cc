@@ -34,8 +34,8 @@ bool ReadUint32(const std::string& input, std::size_t& offset,
     return false;
   }
 
-  const auto* bytes = reinterpret_cast<const unsigned char*>(
-      input.data() + offset);
+  const auto* bytes =
+      reinterpret_cast<const unsigned char*>(input.data() + offset);
   value = (static_cast<std::uint32_t>(bytes[0]) << 24U) |
           (static_cast<std::uint32_t>(bytes[1]) << 16U) |
           (static_cast<std::uint32_t>(bytes[2]) << 8U) |
@@ -128,7 +128,8 @@ bool ReadHeader(const std::string& input, std::size_t& offset,
 const std::uint32_t RpcHeader::MAGIC = 0x43525043U;
 
 // 请求帧布局：
-// [header][service length][service][method length][method][payload length][payload]
+// [header][service length][service][method length][method][payload
+// length][payload]
 bool RpcRequest::Serialize(std::string& out) const {
   try {
     std::size_t body_size = 0;
@@ -195,8 +196,8 @@ bool RpcRequest::Deserialize(const std::string& in) {
 bool RpcResponse::Serialize(std::string& out) const {
   try {
     std::size_t body_size = 0;
-    if (!CalculateBodySize(kResponseFixedBodySize, error_message_,
-                           result_data_, body_size)) {
+    if (!CalculateBodySize(kResponseFixedBodySize, error_message_, result_data_,
+                           body_size)) {
       LOG_ERROR("RPC response is too large to serialize");
       out.clear();
       return false;

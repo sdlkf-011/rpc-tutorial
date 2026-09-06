@@ -1,31 +1,34 @@
+#include "rpc_protocol.h"
+
 #include <gtest/gtest.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 
-#include "rpc_protocol.h"
-
 namespace cookrpc {
 namespace {
 
+// 协议字段读取辅助模块：按网络字节序解析测试帧中的 32 位整数。
 std::uint32_t ReadUint32(const std::string& input, std::size_t offset) {
-  const auto* bytes = reinterpret_cast<const unsigned char*>(
-      input.data() + offset);
+  const auto* bytes =
+      reinterpret_cast<const unsigned char*>(input.data() + offset);
   return (static_cast<std::uint32_t>(bytes[0]) << 24U) |
          (static_cast<std::uint32_t>(bytes[1]) << 16U) |
          (static_cast<std::uint32_t>(bytes[2]) << 8U) |
          static_cast<std::uint32_t>(bytes[3]);
 }
 
-void WriteUint32(std::string& output, std::size_t offset,
-                 std::uint32_t value) {
+// 协议字段写入辅助模块：构造带有指定错误字段的畸形测试帧。
+void WriteUint32(std::string& output, std::size_t offset, std::uint32_t value) {
   output[offset] = static_cast<char>((value >> 24U) & 0xffU);
   output[offset + 1] = static_cast<char>((value >> 16U) & 0xffU);
   output[offset + 2] = static_cast<char>((value >> 8U) & 0xffU);
   output[offset + 3] = static_cast<char>(value & 0xffU);
 }
 
+// RPC 请求/响应测试模块：覆盖字段往返、固定帧布局和二进制载荷。
+// 验证请求的序列号、服务、方法和二进制载荷可完整往返。
 TEST(RpcRequestTest, RoundTripsAllFieldsIncludingBinaryPayload) {
   RpcRequest source;
   source.SetSequenceId(0x10203040U);
@@ -44,6 +47,7 @@ TEST(RpcRequestTest, RoundTripsAllFieldsIncludingBinaryPayload) {
   EXPECT_EQ(result.GetPayload(), source.GetPayload());
 }
 
+// 验证请求帧字段顺序、长度和网络字节序符合协议约定。
 TEST(RpcRequestTest, UsesStableNetworkByteOrderLayout) {
   RpcRequest request;
   request.SetSequenceId(0x01020304U);
@@ -66,6 +70,7 @@ TEST(RpcRequestTest, UsesStableNetworkByteOrderLayout) {
   EXPECT_EQ(frame.substr(30), "data");
 }
 
+// 验证响应的序列号、错误信息和结果数据可完整往返。
 TEST(RpcResponseTest, RoundTripsSuccessAndErrorFields) {
   RpcResponse source;
   source.SetSequenceId(99U);
@@ -84,6 +89,7 @@ TEST(RpcResponseTest, RoundTripsSuccessAndErrorFields) {
   EXPECT_EQ(result.GetResultData(), std::string("result\0data", 11));
 }
 
+// 验证请求帧损坏或带尾随数据时失败，并保留目标对象原值。
 TEST(RpcRequestTest, RejectsMalformedFramesWithoutChangingDestination) {
   RpcRequest source;
   source.SetSequenceId(42U);
@@ -111,8 +117,8 @@ TEST(RpcRequestTest, RejectsMalformedFramesWithoutChangingDestination) {
   WriteUint32(bad_field_size, 12, 0xffffffffU);
   EXPECT_FALSE(destination.Deserialize(bad_field_size));
 
-  EXPECT_FALSE(destination.Deserialize(
-      valid_frame.substr(0, valid_frame.size() - 1)));
+  EXPECT_FALSE(
+      destination.Deserialize(valid_frame.substr(0, valid_frame.size() - 1)));
   EXPECT_FALSE(destination.Deserialize(valid_frame + "trailing data"));
 
   EXPECT_EQ(destination.GetSequenceId(), 7U);
@@ -121,6 +127,7 @@ TEST(RpcRequestTest, RejectsMalformedFramesWithoutChangingDestination) {
   EXPECT_EQ(destination.GetPayload(), "existing payload");
 }
 
+// 验证响应字段长度损坏时失败，并保留目标对象原值。
 TEST(RpcResponseTest, RejectsMalformedFramesWithoutChangingDestination) {
   RpcResponse source;
   source.SetSequenceId(42U);

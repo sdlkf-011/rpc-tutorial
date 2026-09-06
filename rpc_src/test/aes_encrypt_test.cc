@@ -1,3 +1,5 @@
+#include "aes_encrypt.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -5,11 +7,11 @@
 #include <string>
 #include <vector>
 
-#include "aes_encrypt.h"
-
 namespace cookrpc {
 namespace {
 
+// AES 单元测试模块：覆盖单例、输入校验、文本/二进制往返及认证完整性。
+// 验证加密器通过单例接口返回同一个对象。
 TEST(AesEncryptTest, ReturnsSameSingletonInstance) {
   AesEncrypt& first = AesEncrypt::GetInstance();
   AesEncrypt& second = AesEncrypt::GetInstance();
@@ -17,12 +19,14 @@ TEST(AesEncryptTest, ReturnsSameSingletonInstance) {
   EXPECT_EQ(&first, &second);
 }
 
+// 验证空明文被拒绝且不会生成密文。
 TEST(AesEncryptTest, RejectsEmptyPlaintext) {
   std::string ciphertext;
 
   EXPECT_FALSE(AesEncrypt::GetInstance().Encrypt("", ciphertext));
 }
 
+// 验证空输入、错误内容和非法 Base64 密文均会被拒绝。
 TEST(AesEncryptTest, RejectsInvalidCiphertexts) {
   std::string plaintext;
   AesEncrypt& encryptor = AesEncrypt::GetInstance();
@@ -32,13 +36,10 @@ TEST(AesEncryptTest, RejectsInvalidCiphertexts) {
   EXPECT_FALSE(encryptor.Decrypt(std::string(48, '!'), plaintext));
 }
 
+// 验证 ASCII 与 UTF-8 文本加密后能够完整解密还原。
 TEST(AesEncryptTest, RoundTripsTextPayloads) {
   const std::vector<std::string> payloads = {
-      "a",
-      "ab",
-      "abc",
-      "CookRPC encryption unit test",
-      u8"支持 UTF-8 文本",
+      "a", "ab", "abc", "CookRPC encryption unit test", u8"支持 UTF-8 文本",
   };
   AesEncrypt& encryptor = AesEncrypt::GetInstance();
 
@@ -53,6 +54,7 @@ TEST(AesEncryptTest, RoundTripsTextPayloads) {
   }
 }
 
+// 验证包含空字节和高位字节的二进制载荷可无损往返。
 TEST(AesEncryptTest, RoundTripsBinaryPayload) {
   std::string payload;
   payload.reserve(512);
@@ -70,6 +72,7 @@ TEST(AesEncryptTest, RoundTripsBinaryPayload) {
   EXPECT_EQ(plaintext, payload);
 }
 
+// 验证相同明文因随机 nonce 产生不同密文且都能解密。
 TEST(AesEncryptTest, ProducesIndependentCiphertexts) {
   const std::string payload = "the same plaintext";
   std::string first_ciphertext;
@@ -90,6 +93,7 @@ TEST(AesEncryptTest, ProducesIndependentCiphertexts) {
   EXPECT_EQ(second_plaintext, payload);
 }
 
+// 验证篡改密文会触发 GCM 认证失败并清空明文输出。
 TEST(AesEncryptTest, RejectsTamperedCiphertext) {
   std::string ciphertext;
   AesEncrypt& encryptor = AesEncrypt::GetInstance();
@@ -97,14 +101,14 @@ TEST(AesEncryptTest, RejectsTamperedCiphertext) {
   ASSERT_GT(ciphertext.size(), 8U);
 
   const size_t changed_index = ciphertext.size() / 2;
-  ciphertext[changed_index] =
-      ciphertext[changed_index] == 'A' ? 'B' : 'A';
+  ciphertext[changed_index] = ciphertext[changed_index] == 'A' ? 'B' : 'A';
   std::string plaintext = "stale plaintext";
 
   EXPECT_FALSE(encryptor.Decrypt(ciphertext, plaintext));
   EXPECT_TRUE(plaintext.empty());
 }
 
+// 验证输出使用合法 Base64 字符集并满足四字符对齐。
 TEST(AesEncryptTest, ProducesBase64Ciphertext) {
   const std::string base64_alphabet =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
@@ -112,11 +116,10 @@ TEST(AesEncryptTest, ProducesBase64Ciphertext) {
 
   ASSERT_TRUE(AesEncrypt::GetInstance().Encrypt("CookRPC", ciphertext));
   EXPECT_EQ(ciphertext.size() % 4, 0U);
-  EXPECT_TRUE(std::all_of(ciphertext.begin(), ciphertext.end(),
-                          [&base64_alphabet](char character) {
-                            return base64_alphabet.find(character) !=
-                                   std::string::npos;
-                          }));
+  EXPECT_TRUE(std::all_of(
+      ciphertext.begin(), ciphertext.end(), [&base64_alphabet](char character) {
+        return base64_alphabet.find(character) != std::string::npos;
+      }));
 }
 
 }  // namespace

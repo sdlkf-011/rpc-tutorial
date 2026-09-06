@@ -59,7 +59,8 @@ size_t ThreadPoolSingleton::GetPoolSize() {
 
 bool ThreadPoolSingleton::Pause() {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (instance_ == nullptr || instance_->GetState() != ThreadPoolState::kRunning) {
+  if (instance_ == nullptr ||
+      instance_->GetState() != ThreadPoolState::kRunning) {
     return false;
   }
   instance_->Pause();
@@ -68,7 +69,8 @@ bool ThreadPoolSingleton::Pause() {
 
 bool ThreadPoolSingleton::Resume() {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (instance_ == nullptr || instance_->GetState() != ThreadPoolState::kPaused) {
+  if (instance_ == nullptr ||
+      instance_->GetState() != ThreadPoolState::kPaused) {
     return false;
   }
   instance_->Resume();
@@ -95,6 +97,7 @@ bool ThreadPoolSingleton::Exists() {
 
 ThreadPoolState ThreadPoolSingleton::GetState() {
   std::lock_guard<std::mutex> lock(mutex_);
-  return instance_ == nullptr ? ThreadPoolState::kStopped : instance_->GetState();
+  return instance_ == nullptr ? ThreadPoolState::kStopped
+                              : instance_->GetState();
 }
 }  // namespace meeting_ctrl

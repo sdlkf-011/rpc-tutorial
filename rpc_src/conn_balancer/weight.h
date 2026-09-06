@@ -1,12 +1,13 @@
 #ifndef RPC_TUTORIAL_RPC_SRC_CONN_BALANCER_WEIGHT_H_
 #define RPC_TUTORIAL_RPC_SRC_CONN_BALANCER_WEIGHT_H_
 
-#include "load_balancer.h"
 #include <atomic>
 #include <cstddef>
 #include <map>
 #include <string>
 #include <vector>
+
+#include "load_balancer.h"
 
 namespace cookrpc {
 
@@ -30,7 +31,7 @@ class WeightRoundRobinLoadBalancer : public LoadBalancer {
     }
 
     // 递增计算器并取模
-    current_index_ = (current_index_  + 1) % total_weight;
+    current_index_ = (current_index_ + 1) % total_weight;
 
     // 根据累积权重找到对应实例
     int current_weight = 0;
@@ -44,15 +45,16 @@ class WeightRoundRobinLoadBalancer : public LoadBalancer {
     // 降级: 返回第一个实例
     return instances[0];
   }
+
  private:
-  std::atomic<int> current_index_; // 当前索引
-  std::map<std::string, int> weights_; // 实例权重映射
+  std::atomic<int> current_index_;      // 当前索引
+  std::map<std::string, int> weights_;  // 实例权重映射
 
   // 设置实例权重
   void SetWeight(const std::string& instance, int weight) {
     weights_[instance] = weight;
   }
 };
-} // namespace cookrpc
+}  // namespace cookrpc
 
-#endif // RPC_TUTORIAL_RPC_SRC_CONN_BALANCER_WEIGHT_H_
+#endif  // RPC_TUTORIAL_RPC_SRC_CONN_BALANCER_WEIGHT_H_

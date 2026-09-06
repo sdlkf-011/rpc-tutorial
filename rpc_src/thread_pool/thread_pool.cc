@@ -13,9 +13,7 @@
 namespace meeting_ctrl {
 namespace {
 
-size_t NormalizeThreadCount(size_t count) {
-  return count == 0 ? 1 : count;
-}
+size_t NormalizeThreadCount(size_t count) { return count == 0 ? 1 : count; }
 
 void JoinWorkers(std::vector<std::thread>* workers) {
   for (std::thread& worker : *workers) {
@@ -66,7 +64,7 @@ ThreadPool::ThreadPool(const ThreadPoolStruct& config)
 
   workers_.reserve(config_.max_threads);
   thread_last_active_.resize(config_.max_threads);
-  
+
   for (size_t i = 0; i < config_.core_threads; ++i) {
     current_threads_.fetch_add(1);
     workers_.emplace_back(&ThreadPool::WorkerThread, this);
@@ -82,18 +80,20 @@ void ThreadPool::WorkerThread() {
     TaskWrapper task;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
-      const bool signaled = condition_.wait_for(
-        lock, config_.keep_alive_time, [this] {
-          return stop_ || ((state_ == ThreadPoolState::kRunning ||
-                 state_ == ThreadPoolState::kShuttingDown) &&
-                 !tasks_.empty());
-      });
+      const bool signaled =
+          condition_.wait_for(lock, config_.keep_alive_time, [this] {
+            return stop_ || ((state_ == ThreadPoolState::kRunning ||
+                              state_ == ThreadPoolState::kShuttingDown) &&
+                             !tasks_.empty());
+          });
 
       // 非核心线程在空闲超时后退出，核心线程始终保留。
       if (!signaled && current_threads_.load() > config_.core_threads) {
         current_threads_.fetch_sub(1);
-        LOG_INFO("[ThreadPool] Worker thread {} exited after idle timeout, "
-                 "remaining threads: {}", thread_id, current_threads_.load());
+        LOG_INFO(
+            "[ThreadPool] Worker thread {} exited after idle timeout, "
+            "remaining threads: {}",
+            thread_id, current_threads_.load());
         return;
       }
 
@@ -108,9 +108,10 @@ void ThreadPool::WorkerThread() {
       task = std::move(const_cast<TaskWrapper&>(tasks_.top()));
       tasks_.pop();
 
-      LOG_DEBUG("[ThreadPool] Thread {} picked up task, queue size: {}, "
-                "active threads: {}", thread_id, tasks_.size(),
-                active_threads_.load());
+      LOG_DEBUG(
+          "[ThreadPool] Thread {} picked up task, queue size: {}, "
+          "active threads: {}",
+          thread_id, tasks_.size(), active_threads_.load());
     }
 
     if (!task.Valid()) {
@@ -133,8 +134,9 @@ void ThreadPool::WorkerThread() {
     }
 
     const auto end_time = std::chrono::steady_clock::now();
-    const double duration_ms = 
-      std::chrono::duration<double, std::milli>(end_time - start_time).count();
+    const double duration_ms =
+        std::chrono::duration<double, std::milli>(end_time - start_time)
+            .count();
     {
       std::lock_guard<std::mutex> lock(stats_mutex_);
       total_task_time_ += duration_ms;
@@ -263,11 +265,7 @@ void ThreadPool::Stop() {
   current_threads_.store(0);
 }
 
-ThreadPoolState ThreadPool::GetState() const noexcept {
-  return state_.load();
-}
+ThreadPoolState ThreadPool::GetState() const noexcept { return state_.load(); }
 
-ThreadPool::~ThreadPool() {
-  Stop();
-}
+ThreadPool::~ThreadPool() { Stop(); }
 }  // namespace meeting_ctrl

@@ -1,5 +1,8 @@
 #include "zk_conn_handler.h"
 
+#include <zookeeper/zookeeper.h>
+#include <zookeeper/zookeeper.jute.h>
+
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -13,12 +16,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
-#include <zookeeper/zookeeper.h>
-#include <zookeeper/zookeeper.jute.h>
 
+#include "load_balancer.h"
 #include "log_manager.h"
 #include "registry_config.h"
-#include "load_balancer.h"
 
 namespace cookrpc {
 
@@ -29,7 +30,7 @@ bool ZkConnHandler::InitZkConnHandler(const nlohmann::json& config) {
       LOG_ERROR("Empty configuration");
       return false;
     }
-  
+
     // 安全的读取参数配置
     try {
       std::string zk_host = config.value("zk_host", "localhost");
@@ -62,7 +63,8 @@ bool ZkConnHandler::InitZkConnHandler(const nlohmann::json& config) {
   }
 }
 
-std::vector<std::string> ZkConnHandler::GetAllServers(const std::string& zk_namespace) {
+std::vector<std::string> ZkConnHandler::GetAllServers(
+    const std::string& zk_namespace) {
   // 确保 ZooKeeper 连接可用
   if (!EnsureZkConnection()) {
     LOG_ERROR("ZooKeeper connection not available");
@@ -95,12 +97,14 @@ std::vector<std::string> ZkConnHandler::GetAllServers(const std::string& zk_name
       int buffer_len = sizeof(buffer);
 
       // 获取节点的数量
-      int rc = zoo_get(zk_client_, node_path.c_str(), 0, buffer, &buffer_len, nullptr);
+      int rc = zoo_get(zk_client_, node_path.c_str(), 0, buffer, &buffer_len,
+                       nullptr);
       if (rc == ZOK && buffer_len > 0) {
         std::string server_ip(buffer, buffer_len);
         servers.push_back(server_ip);
       } else {
-        LOG_WARN("Failed to get data for node: {}, error: {}", node_path, zerror(rc));
+        LOG_WARN("Failed to get data for node: {}, error: {}", node_path,
+                 zerror(rc));
       }
     }
 
@@ -136,7 +140,8 @@ bool ZkConnHandler::RegisterService(const std::string& service_name,
     const std::shared_ptr<ServiceRegistry> registry =
         GetOrCreateServiceRegistry();
     if (!registry) {
-      LOG_ERROR("Failed to get or create ServiceRegistry for service registration");
+      LOG_ERROR(
+          "Failed to get or create ServiceRegistry for service registration");
       return false;
     }
 
@@ -144,19 +149,22 @@ bool ZkConnHandler::RegisterService(const std::string& service_name,
     if (registry->RegisterService(service_name, service_address)) {
       return true;
     } else {
-      LOG_ERROR("Failed to register service: {} at {}", service_name, service_address);
+      LOG_ERROR("Failed to register service: {} at {}", service_name,
+                service_address);
       return false;
     }
   } catch (const std::exception& e) {
     LOG_ERROR("Exception during service registration: {}", e.what());
     return false;
-  }                                      
+  }
 }
 
-bool ZkConnHandler::ReisterServicesFromConfig(const cookrpc::ServiceRegistryConfig* registry_config) {
+bool ZkConnHandler::ReisterServicesFromConfig(
+    const cookrpc::ServiceRegistryConfig* registry_config) {
   // 没有配置不算错误
   if (!registry_config || registry_config->GetRegistryNodesSize() == 0) {
-    LOG_WARN("No registry configuration found, skipping ZooKeeper registration");
+    LOG_WARN(
+        "No registry configuration found, skipping ZooKeeper registration");
     return true;
   }
 
@@ -165,7 +173,9 @@ bool ZkConnHandler::ReisterServicesFromConfig(const cookrpc::ServiceRegistryConf
     const std::shared_ptr<ServiceRegistry> registry =
         GetOrCreateServiceRegistry();
     if (!registry) {
-      LOG_ERROR("Failed to get or create ServiceRegistry for batch service registration");
+      LOG_ERROR(
+          "Failed to get or create ServiceRegistry for batch service "
+          "registration");
       return false;
     }
 
@@ -175,11 +185,14 @@ bool ZkConnHandler::ReisterServicesFromConfig(const cookrpc::ServiceRegistryConf
 
     bool all_success = true;
     for (const auto& node : registry_nodes) {
-      std::string service_address = node.address + ":" + std::to_string(node.port);
+      std::string service_address =
+          node.address + ":" + std::to_string(node.port);
       if (registry->RegisterService(service_name, service_address)) {
-        LOG_INFO("Successfully registered service: {} at {}", service_name, service_address);
+        LOG_INFO("Successfully registered service: {} at {}", service_name,
+                 service_address);
       } else {
-        LOG_ERROR("Failed to register service: {} at {}", service_name, service_address);
+        LOG_ERROR("Failed to register service: {} at {}", service_name,
+                  service_address);
         all_success = false;
       }
     }
@@ -274,7 +287,7 @@ bool ZkConnHandler::EnsureZkConnection() {
         client_valid = zk_client_ != nullptr;
         if (client_valid) {
           // 尝试一个简单的操作测试连接
-          struct Stat stat{};
+          struct Stat stat {};
           exists_result = zoo_exists(zk_client_, "/", 0, &stat);
         }
       }
@@ -292,8 +305,7 @@ bool ZkConnHandler::EnsureZkConnection() {
     }
 
     // 不可恢复的错误状态
-    if (state == ZOO_EXPIRED_SESSION_STATE ||
-        state == ZOO_AUTH_FAILED_STATE ||
+    if (state == ZOO_EXPIRED_SESSION_STATE || state == ZOO_AUTH_FAILED_STATE ||
         (state != ZOO_CONNECTED_STATE && retry_count > 10)) {
       LOG_ERROR("Connection failed with state: {} ({})", state, state_desc);
       CleanUp();
@@ -330,7 +342,7 @@ void ZkConnHandler::CleanUp() {
       zk_client_ = nullptr;
     } catch (const std::exception& e) {
       zk_client_ = nullptr;
-    } catch(...) {
+    } catch (...) {
       zk_client_ = nullptr;
     }
   }
@@ -339,12 +351,10 @@ void ZkConnHandler::CleanUp() {
   running_ = false;
 }
 
-ZkConnHandler::~ZkConnHandler() {
-  CleanUp();
-}
+ZkConnHandler::~ZkConnHandler() { CleanUp(); }
 
 void ZkConnHandler::GlobalWatcher(zhandle_t* zh, int type, int state,
-                            const char* path, void* watcherCtx) {
+                                  const char* path, void* watcherCtx) {
   (void)zh;
   (void)path;
 
@@ -390,7 +400,8 @@ bool ZkConnHandler::CreateServiceRegistryIfNeeded() {
 
     // 验证连接状态
     if (!service_registry_->IsConnected()) {
-      LOG_ERROR("Failed to connect ServiceRegistry to ZooKeeper at {}", zk_connection);
+      LOG_ERROR("Failed to connect ServiceRegistry to ZooKeeper at {}",
+                zk_connection);
       service_registry_.reset();
       return false;
     }
@@ -417,13 +428,12 @@ bool ZkConnHandler::InitZkClient() {
     return false;
   }
 
-  const std::string connection =
-      zk_host_ + ":" + std::to_string(zk_port_);
+  const std::string connection = zk_host_ + ":" + std::to_string(zk_port_);
 
   running_.store(false, std::memory_order_release);
   errno = 0;
-  zhandle_t* client = zookeeper_init(
-      connection.c_str(), GlobalWatcher, 30000, nullptr, this, 0);
+  zhandle_t* client = zookeeper_init(connection.c_str(), GlobalWatcher, 30000,
+                                     nullptr, this, 0);
   if (client == nullptr) {
     const int error_number = errno;
     LOG_ERROR("Failed to initialize ZooKeeper client for {}: {} (errno: {})",
@@ -435,4 +445,4 @@ bool ZkConnHandler::InitZkClient() {
   LOG_INFO("ZooKeeper client initialized for {}", connection);
   return true;
 }
-} // namespace cookrpc
+}  // namespace cookrpc

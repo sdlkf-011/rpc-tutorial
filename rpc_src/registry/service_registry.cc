@@ -34,9 +34,8 @@ ServiceRegistry::ServiceRegistry(const std::string& zk_hosts) {
   // 保留客户端句柄，以便后续重连时继续更新连接状态。
   std::unique_lock<std::mutex> lock(connection_mutex_);
   const bool connected = connection_cv_.wait_for(
-    lock, std::chrono::milliseconds(kConnectionTimeoutMs), [this] {
-    return is_connected_.load(std::memory_order_acquire);
-  });
+      lock, std::chrono::milliseconds(kConnectionTimeoutMs),
+      [this] { return is_connected_.load(std::memory_order_acquire); });
 
   if (!connected) {
     LOG_WARN("Timed out connecting to ZooKeeper: {}", zk_hosts);
@@ -87,7 +86,7 @@ bool ServiceRegistry::RegisterService(const std::string& service_name,
     LOG_ERROR("Cannot register service while ZooKeeper is disconnected");
     return false;
   }
-  
+
   if (!IsValidPathSegment(service_name) ||
       !IsValidPathSegment(service_address)) {
     LOG_ERROR("Invalid service name or address: service={}, address={}",
@@ -113,8 +112,7 @@ bool ServiceRegistry::RegisterService(const std::string& service_name,
 }
 
 bool ServiceRegistry::IsConnected() const {
-  return zk_handle_ != nullptr &&
-         is_connected_.load(std::memory_order_acquire);
+  return zk_handle_ != nullptr && is_connected_.load(std::memory_order_acquire);
 }
 
 bool ServiceRegistry::CreateNode(const std::string& path,
@@ -128,9 +126,9 @@ bool ServiceRegistry::CreateNode(const std::string& path,
     return false;
   }
 
-  const int result = zoo_create(
-      zk_handle_, path.c_str(), data.data(), static_cast<int>(data.size()),
-      &ZOO_OPEN_ACL_UNSAFE, flags, nullptr, 0);
+  const int result = zoo_create(zk_handle_, path.c_str(), data.data(),
+                                static_cast<int>(data.size()),
+                                &ZOO_OPEN_ACL_UNSAFE, flags, nullptr, 0);
   if (result == ZOK) {
     return true;
   }

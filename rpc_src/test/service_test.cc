@@ -12,12 +12,14 @@
 namespace cookrpc {
 namespace {
 
+// 服务故障模式模块：用于模拟正常返回、标准异常和未知异常。
 enum class FailureMode {
   kNone,
   kStandardException,
   kUnknownException,
 };
 
+// 测试服务模块：记录请求参数，并可控地返回结果或触发异常。
 class TestService final : public Service {
  public:
   explicit TestService(std::string service_name)
@@ -64,6 +66,8 @@ class TestService final : public Service {
   bool handle_result_ = true;
 };
 
+// 服务管理器测试模块：覆盖注册、查找、同步/异步转发和异常清理。
+// 验证服务管理器拒绝空指针和空名称服务。
 TEST(ServiceManagerTest, RejectsNullAndEmptyNamedServices) {
   ServiceManager& manager = ServiceManager::GetInstance();
 
@@ -71,6 +75,7 @@ TEST(ServiceManagerTest, RejectsNullAndEmptyNamedServices) {
   EXPECT_FALSE(manager.RegisterService(std::make_shared<TestService>("")));
 }
 
+// 验证读取服务名称抛出任意异常时注册失败且不写入管理器。
 TEST(ServiceManagerTest, RejectsServicesWhenReadingTheirNameThrows) {
   ServiceManager& manager = ServiceManager::GetInstance();
   auto standard_failure =
@@ -86,6 +91,7 @@ TEST(ServiceManagerTest, RejectsServicesWhenReadingTheirNameThrows) {
   EXPECT_EQ(manager.GetService("ServiceNameUnknownFailure"), nullptr);
 }
 
+// 验证合法服务可注册，并能按名称查找或正确返回不存在结果。
 TEST(ServiceManagerTest, RegistersAndRetrievesService) {
   ServiceManager& manager = ServiceManager::GetInstance();
   auto service = std::make_shared<TestService>("LookupService");
@@ -97,6 +103,7 @@ TEST(ServiceManagerTest, RegistersAndRetrievesService) {
   EXPECT_EQ(manager.GetService("MissingLookupService"), nullptr);
 }
 
+// 验证重复名称注册失败，同时保留最初注册的服务对象。
 TEST(ServiceManagerTest, RejectsDuplicateNameAndKeepsOriginalService) {
   ServiceManager& manager = ServiceManager::GetInstance();
   auto original = std::make_shared<TestService>("DuplicateService");
@@ -108,6 +115,7 @@ TEST(ServiceManagerTest, RejectsDuplicateNameAndKeepsOriginalService) {
   EXPECT_EQ(manager.GetService("DuplicateService"), original);
 }
 
+// 验证同步请求转发方法名、参数和服务返回结果均保持一致。
 TEST(ServiceManagerTest, ForwardsSynchronousRequestAndResult) {
   ServiceManager& manager = ServiceManager::GetInstance();
   auto service = std::make_shared<TestService>("SynchronousService");
@@ -122,6 +130,7 @@ TEST(ServiceManagerTest, ForwardsSynchronousRequestAndResult) {
   EXPECT_EQ(result, "response payload");
 }
 
+// 验证处理器返回失败时管理器传递失败状态及其输出内容。
 TEST(ServiceManagerTest, ReturnsHandlerFailureWithoutChangingItsOutput) {
   ServiceManager& manager = ServiceManager::GetInstance();
   auto service = std::make_shared<TestService>("FailingResultService");
@@ -130,11 +139,12 @@ TEST(ServiceManagerTest, ReturnsHandlerFailureWithoutChangingItsOutput) {
   ASSERT_TRUE(manager.RegisterService(service));
   std::string result;
 
-  EXPECT_FALSE(manager.HandleRpcRequest("FailingResultService", "Fail", "",
-                                        result));
+  EXPECT_FALSE(
+      manager.HandleRpcRequest("FailingResultService", "Fail", "", result));
   EXPECT_EQ(result, "failure details");
 }
 
+// 验证目标服务不存在时请求失败并清空过期结果。
 TEST(ServiceManagerTest, ClearsResultWhenServiceDoesNotExist) {
   std::string result = "stale result";
 
@@ -143,13 +153,13 @@ TEST(ServiceManagerTest, ClearsResultWhenServiceDoesNotExist) {
   EXPECT_TRUE(result.empty());
 }
 
+// 验证处理器抛出标准或未知异常时请求失败并清空结果。
 TEST(ServiceManagerTest, ClearsResultWhenHandlerThrows) {
   ServiceManager& manager = ServiceManager::GetInstance();
   auto standard_failure =
       std::make_shared<TestService>("HandlerStandardFailure");
   standard_failure->SetHandleFailure(FailureMode::kStandardException);
-  auto unknown_failure =
-      std::make_shared<TestService>("HandlerUnknownFailure");
+  auto unknown_failure = std::make_shared<TestService>("HandlerUnknownFailure");
   unknown_failure->SetHandleFailure(FailureMode::kUnknownException);
   ASSERT_TRUE(manager.RegisterService(standard_failure));
   ASSERT_TRUE(manager.RegisterService(unknown_failure));
@@ -164,6 +174,7 @@ TEST(ServiceManagerTest, ClearsResultWhenHandlerThrows) {
   EXPECT_TRUE(unknown_result.empty());
 }
 
+// 验证异步请求正确提交到线程池，并最终返回服务处理结果。
 TEST(ServiceManagerTest, ForwardsAsynchronousRequest) {
   ServiceManager& manager = ServiceManager::GetInstance();
   auto service = std::make_shared<TestService>("AsynchronousService");

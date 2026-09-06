@@ -5,8 +5,8 @@
 #include <memory>
 #include <string>
 
-#include "thread_pool_config.h"
 #include "registry_config.h"
+#include "thread_pool_config.h"
 
 namespace cookrpc {
 
@@ -25,17 +25,11 @@ class RpcServerConfig {
     servers_name_prefix_ = servers_name_prefix;
   }
 
-  void SetServersIp(const std::string& servers_ip) {
-    servers_ip_ = servers_ip;
-  }
+  void SetServersIp(const std::string& servers_ip) { servers_ip_ = servers_ip; }
 
-  void SetServersPort(uint16_t servers_port) {
-    servers_port_ = servers_port;
-  }
+  void SetServersPort(uint16_t servers_port) { servers_port_ = servers_port; }
 
-  void SetTimeout(uint32_t timeout) {
-    timeout_ = timeout;
-  }
+  void SetTimeout(uint32_t timeout) { timeout_ = timeout; }
 
   void SetMaxConnections(uint32_t max_connections) {
     max_connections_ = max_connections;
@@ -46,21 +40,13 @@ class RpcServerConfig {
     return servers_name_prefix_;
   }
 
-  const std::string& GetServersIp() const {
-    return servers_ip_;
-  }
+  const std::string& GetServersIp() const { return servers_ip_; }
 
-  uint16_t GetServersPort() const {
-    return servers_port_;
-  }
+  uint16_t GetServersPort() const { return servers_port_; }
 
-  uint32_t GetTimeout() const {
-    return timeout_;
-  }
+  uint32_t GetTimeout() const { return timeout_; }
 
-  uint32_t GetMaxConnections() const {
-    return max_connections_;
-  }
+  uint32_t GetMaxConnections() const { return max_connections_; }
 
   // 获取子配置
   const ServiceRegistryConfig* GetServiceRegistryConfig() const {
@@ -75,6 +61,7 @@ class RpcServerConfig {
   RpcServerConfig& operator=(const RpcServerConfig&) = delete;
   RpcServerConfig(RpcServerConfig&&) = delete;
   RpcServerConfig& operator=(RpcServerConfig&&) = delete;
+
  private:
   // 基础配置
   uint32_t max_connections_ = 0;
@@ -89,9 +76,9 @@ class RpcServerConfig {
 
   // 私有构造函数
   RpcServerConfig()
-    : thread_pool_config_(std::make_unique<ThreadPoolConfig>()),
-      service_registry_config_(std::make_unique<ServiceRegistryConfig>()) {}
+      : thread_pool_config_(std::make_unique<ThreadPoolConfig>()),
+        service_registry_config_(std::make_unique<ServiceRegistryConfig>()) {}
 };
-} // namespace cookrpc
+}  // namespace cookrpc
 
-#endif // RPC_TUTORIAL_RPC_SRC_LOAD_CONFIG_RPC_SERVER_CONFIG_H_
+#endif  // RPC_TUTORIAL_RPC_SRC_LOAD_CONFIG_RPC_SERVER_CONFIG_H_

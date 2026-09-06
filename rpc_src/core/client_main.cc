@@ -1,10 +1,9 @@
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <string>
 
-#include <nlohmann/json.hpp>
-
-#include "rpc_client.h"
 #include "log_manager.h"
+#include "rpc_client.h"
 
 namespace {
 
@@ -34,8 +33,8 @@ int main(int argc, char* argv[]) {
   // 使用 JSON 序列化完成一次同步 Echo 调用。
   const nlohmann::json request = {{"message", message}};
   nlohmann::json response;
-  if (!client.Call("RpcService", "Echo", request,
-                   cookrpc::SerializeType::JSON, response)) {
+  if (!client.Call("RpcService", "Echo", request, cookrpc::SerializeType::JSON,
+                   response)) {
     CLIENT_FATAL("Echo RPC call failed");
     return 1;
   }

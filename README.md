@@ -17,7 +17,8 @@
 - OpenSSL、Protobuf、fmt、spdlog、nlohmann-json、zstd、ZooKeeper C client 和 GoogleTest（测试需要）。
 - 正常运行 RPC 服务需要 ZooKeeper 服务端，默认地址为 `localhost:2181`。
 
-项目使用 vcpkg 的 CMake config package。安装依赖后设置 `VCPKG_ROOT`，例如：
+项目支持 vcpkg 和系统包管理器。使用 vcpkg 时可以显式设置 `VCPKG_ROOT`；如果
+`vcpkg` 已在 `PATH` 中，构建脚本会自动找到它：
 
 ```bash
 export VCPKG_ROOT=/path/to/vcpkg
@@ -30,21 +31,25 @@ ${VCPKG_ROOT}/vcpkg install openssl protobuf fmt spdlog nlohmann-json zstd zooke
 
 ## 构建
 
-推荐使用仓库提供的脚本。脚本会先重新生成 `protos/message.pb.h` 和 `protos/message.pb.cc`，然后配置并编译项目：
+推荐使用仓库提供的脚本。CMake 会使用当前依赖环境中的 `protoc`，并将生成文件放在
+构建目录中，不会复用其他环境生成的源码树文件：
 
 ```bash
 export VCPKG_ROOT=/path/to/vcpkg
 ./rpc_build.sh
 ```
 
-也可以直接使用 CMake：
+也可以不使用 vcpkg，直接让 CMake 从系统前缀查找依赖：
 
 ```bash
-./protos/compile_proto.sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+  -DCMAKE_PREFIX_PATH=/path/to/dependency-prefix
 cmake --build build --parallel
 ```
+
+`rpc_build.sh` 会记录构建时使用的工具链、vcpkg triplet、依赖前缀和编译器。
+这些设置变化（例如换电脑或切换 vcpkg）时，它会自动刷新 CMake 缓存，避免继续使用旧的绝对路径。
+也可以通过 `BUILD_DIR` 为不同环境使用独立的构建目录。
 
 构建产物位于 `build/`：`rpc_server`、`rpc_client` 和 `stress_test_client`。
 
@@ -134,6 +139,7 @@ docs/          补充文档
 ## 开发约定
 
 - 使用 C++17，提交前运行 `git diff --check`。
-- 修改 `.proto` 后重新运行 `./protos/compile_proto.sh`。
+- 修改 `.proto` 后重新配置并构建；CMake 会自动重新生成对应的 C++ 文件。
+- 如需单独生成源码，可运行 `./protos/compile_proto.sh`（输出到 `protos/`）。
 - 新增内部头文件引用时使用 `#include "file.h"`，并确保对应目录在 CMake 的 include path 中。
 - 配置文件中的敏感地址和部署参数不要提交为生产环境值。

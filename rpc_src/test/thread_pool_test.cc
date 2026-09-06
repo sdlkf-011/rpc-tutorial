@@ -1,13 +1,15 @@
+#include "thread_pool.h"
+
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <future>
 
-#include "thread_pool.h"
-
 namespace meeting_ctrl {
 namespace {
 
+// 线程池容量测试模块：验证工作线程、任务队列满载时的快速拒绝和安全关闭。
+// 验证线程池队列满时快速拒绝新任务，并能安全释放和关闭线程。
 TEST(ThreadPoolTest, RejectsNewTaskImmediatelyWhenQueueIsFull) {
   ThreadPoolStruct config;
   config.core_threads = 1;
@@ -18,12 +20,11 @@ TEST(ThreadPoolTest, RejectsNewTaskImmediatelyWhenQueueIsFull) {
 
   std::promise<void> worker_started;
   std::promise<void> release_worker;
-  std::shared_future<void> release_signal =
-      release_worker.get_future().share();
+  std::shared_future<void> release_signal = release_worker.get_future().share();
 
   // 第一个任务占用唯一工作线程，使第二个任务稳定地留在队列中。
-  std::future<int> running = pool.Enqueue(
-      TaskPriority::kNormal, [&worker_started, release_signal] {
+  std::future<int> running =
+      pool.Enqueue(TaskPriority::kNormal, [&worker_started, release_signal] {
         worker_started.set_value();
         release_signal.wait();
         return 1;

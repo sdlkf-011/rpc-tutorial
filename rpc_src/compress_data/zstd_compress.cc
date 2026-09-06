@@ -1,8 +1,9 @@
 #include "zstd_compress.h"
 
+#include <zstd.h>
+
 #include <cstddef>
 #include <string>
-#include <zstd.h>
 
 #include "log_manager.h"
 
@@ -25,13 +26,9 @@ bool ZstdCompress::CompressString(const std::string& src, std::string& dst,
   dst.resize(compressed_size);
 
   // 执行 ZSTD 压缩
-  size_t const actual_size = ZSTD_compress(
-    dst.data(), 
-    compressed_size, 
-    src.data(), 
-    src.size(), 
-    static_cast<int>(level)
-  );
+  size_t const actual_size =
+      ZSTD_compress(dst.data(), compressed_size, src.data(), src.size(),
+                    static_cast<int>(level));
 
   // 检查压缩是否成功
   if (ZSTD_isError(actual_size)) {
@@ -52,11 +49,11 @@ bool ZstdCompress::DecompressString(const std::string& src, std::string& dst) {
   }
 
   // 获取解压后的原始数据大小
-  unsigned long long const decompressed_size = 
-    ZSTD_getFrameContentSize(src.data(), src.size());
-  
+  unsigned long long const decompressed_size =
+      ZSTD_getFrameContentSize(src.data(), src.size());
+
   // 检查是否能够获取有效的解压大小
-  if (decompressed_size == ZSTD_CONTENTSIZE_ERROR || 
+  if (decompressed_size == ZSTD_CONTENTSIZE_ERROR ||
       decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
     return false;
   }
@@ -65,12 +62,8 @@ bool ZstdCompress::DecompressString(const std::string& src, std::string& dst) {
   dst.resize(decompressed_size);
 
   // 执行 ZSTD 解压
-  size_t const actual_size = ZSTD_decompress(
-    dst.data(), 
-    decompressed_size, 
-    src.data(), 
-    src.size()
-  );
+  size_t const actual_size =
+      ZSTD_decompress(dst.data(), decompressed_size, src.data(), src.size());
 
   // 检查解压是否成功
   if (ZSTD_isError(actual_size)) {
@@ -89,19 +82,14 @@ bool ZstdCompress::CompressData(const char* src, size_t src_len,
     dst.clear();
     return true;
   }
-  
+
   // 计算压缩后的最大可能大小
   size_t const compressed_size = ZSTD_compressBound(src_len);
   dst.resize(compressed_size);
 
   // 执行压缩
-  size_t const actual_size = ZSTD_compress(
-    dst.data(), 
-    compressed_size, 
-    src, 
-    src_len, 
-    static_cast<int>(level)
-  );
+  size_t const actual_size = ZSTD_compress(dst.data(), compressed_size, src,
+                                           src_len, static_cast<int>(level));
 
   // 检查压缩结果
   if (ZSTD_isError(actual_size)) {
@@ -114,7 +102,7 @@ bool ZstdCompress::CompressData(const char* src, size_t src_len,
 }
 
 bool ZstdCompress::DecompressData(const char* src, size_t src_len,
-                      std::vector<char>& dst) {
+                                  std::vector<char>& dst) {
   // 处理空数据或空指针
   if (!src || src_len == 0) {
     dst.clear();
@@ -122,11 +110,11 @@ bool ZstdCompress::DecompressData(const char* src, size_t src_len,
   }
 
   // 获取解压后的原始数据大小
-  unsigned long long const decompressed_size = 
-    ZSTD_getFrameContentSize(src, src_len);
-  
+  unsigned long long const decompressed_size =
+      ZSTD_getFrameContentSize(src, src_len);
+
   // 检查有效性
-  if (decompressed_size == ZSTD_CONTENTSIZE_ERROR || 
+  if (decompressed_size == ZSTD_CONTENTSIZE_ERROR ||
       decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
     return false;
   }
@@ -135,12 +123,8 @@ bool ZstdCompress::DecompressData(const char* src, size_t src_len,
   dst.resize(decompressed_size);
 
   // 执行 ZSTD 解压
-  size_t const actual_size = ZSTD_decompress(
-    dst.data(),
-    decompressed_size,
-    src,
-    src_len
-  );
+  size_t const actual_size =
+      ZSTD_decompress(dst.data(), decompressed_size, src, src_len);
 
   // 检查解压是否成功
   if (ZSTD_isError(actual_size)) {
@@ -151,4 +135,4 @@ bool ZstdCompress::DecompressData(const char* src, size_t src_len,
   dst.resize(actual_size);
   return true;
 }
-} // namespace cookrpc
+}  // namespace cookrpc

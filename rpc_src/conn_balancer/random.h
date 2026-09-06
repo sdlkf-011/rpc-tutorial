@@ -28,10 +28,11 @@ class RandomLoadBalancer : public LoadBalancer {
     // 返回随机选中的实例
     return instances[index];
   }
- private:
- std::random_device rd_; // 真随机数生成器
- std::mt19937 gen_; // Mersenne Twister 伪随机数生成器
-};
-} // namespace cookrpc
 
-#endif // RPC_TUTORIAL_RPC_SRC_CONN_BALANCER_RANDOM_H_
+ private:
+  std::random_device rd_;  // 真随机数生成器
+  std::mt19937 gen_;       // Mersenne Twister 伪随机数生成器
+};
+}  // namespace cookrpc
+
+#endif  // RPC_TUTORIAL_RPC_SRC_CONN_BALANCER_RANDOM_H_

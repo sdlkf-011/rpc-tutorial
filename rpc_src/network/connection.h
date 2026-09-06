@@ -18,15 +18,15 @@ class RpcMessage;
 class RpcRequest;
 class RpcResponse;
 
+// 单个 TCP 连接封装：管理非阻塞收发缓冲、RPC 帧解析和生命周期回调。
 class Connection : public std::enable_shared_from_this<Connection> {
  public:
   enum class State { CONNECTED, DISCONNECTING, DISCONNECTED };
 
   // 定义消息回调函数类型
-  using MessageCallback = std::function<void(
-    const std::shared_ptr<Connection>&, const RpcRequest&)>;
-  using CloseCallback =
-    std::function<void(const std::shared_ptr<Connection>&)>;
+  using MessageCallback = std::function<void(const std::shared_ptr<Connection>&,
+                                             const RpcRequest&)>;
+  using CloseCallback = std::function<void(const std::shared_ptr<Connection>&)>;
 
   explicit Connection(int fd);
   ~Connection();
@@ -47,12 +47,8 @@ class Connection : public std::enable_shared_from_this<Connection> {
     std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     return fd_;
   }
-  const std::string& GetPeerAddress() const { 
-    return peer_addr_; 
-  }
-  uint16_t GetPeerPort() const { 
-    return peer_port_; 
-  }
+  const std::string& GetPeerAddress() const { return peer_addr_; }
+  uint16_t GetPeerPort() const { return peer_port_; }
   State GetState() const {
     std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     return state_;
@@ -62,7 +58,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
   std::string GetReadBufferData() {
     std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     std::string data(read_buffer_.begin(), read_buffer_.end());
-    read_buffer_.clear(); // 清空缓冲区
+    read_buffer_.clear();  // 清空缓冲区
     return data;
   }
 
@@ -76,7 +72,8 @@ class Connection : public std::enable_shared_from_this<Connection> {
     close_callback_ = cb;
   }
 
-  static const size_t MAX_MESSAGE_SIZE = 1024 * 1024; // 1MB
+  static const size_t MAX_MESSAGE_SIZE = 1024 * 1024;  // 1MB
+  // 从读缓冲区提取完整 RPC 帧并触发消息回调。
   bool ProcessMessage();
 
  private:
@@ -99,6 +96,6 @@ class Connection : public std::enable_shared_from_this<Connection> {
   // 统一保护套接字生命周期和读写缓冲区，允许错误处理递归进入 Close。
   mutable std::recursive_mutex io_mutex_;
 };
-} // namespace cookrpc
+}  // namespace cookrpc
 
 #endif  // RPC_TUTORIAL_RPC_SRC_NETWORK_CONNECTION_H_

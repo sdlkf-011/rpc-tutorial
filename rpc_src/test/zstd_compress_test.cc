@@ -1,3 +1,5 @@
+#include "zstd_compress.h"
+
 #include <gtest/gtest.h>
 
 #include <array>
@@ -5,11 +7,11 @@
 #include <string>
 #include <vector>
 
-#include "zstd_compress.h"
-
 namespace cookrpc {
 namespace {
 
+// ZSTD 压缩测试模块：覆盖单例、文本/二进制往返、级别选择和非法输入。
+// 验证压缩器单例接口在多次获取时返回同一个对象。
 TEST(ZstdCompressTest, GetInstanceReturnsSameObject) {
   // 单例在进程生命周期内必须保持唯一，避免压缩器状态被重复创建。
   ZstdCompress& first = ZstdCompress::GetInstance();
@@ -18,6 +20,7 @@ TEST(ZstdCompressTest, GetInstanceReturnsSameObject) {
   EXPECT_EQ(&first, &second);
 }
 
+// 验证空字符串压缩和解压成功，并清空调用方目标缓冲区。
 TEST(ZstdCompressTest, EmptyStringClearsDestination) {
   ZstdCompress& compressor = ZstdCompress::GetInstance();
   std::string compressed = "stale compressed data";
@@ -30,6 +33,7 @@ TEST(ZstdCompressTest, EmptyStringClearsDestination) {
   EXPECT_TRUE(decompressed.empty());
 }
 
+// 验证文本及嵌入空字节的字符串能够无损压缩和解压。
 TEST(ZstdCompressTest, StringRoundTripPreservesTextAndEmbeddedNulls) {
   ZstdCompress& compressor = ZstdCompress::GetInstance();
   std::string original = "cookrpc 中文数据";
@@ -44,14 +48,12 @@ TEST(ZstdCompressTest, StringRoundTripPreservesTextAndEmbeddedNulls) {
   EXPECT_EQ(decompressed, original);
 }
 
+// 验证全部公开压缩级别都能生成可正确解压的 ZSTD 数据。
 TEST(ZstdCompressTest, EveryCompressionLevelSupportsRoundTrip) {
   ZstdCompress& compressor = ZstdCompress::GetInstance();
   const std::array<Level, 5> levels = {
-      Level::kFastest,
-      Level::kDefault,
-      Level::kBetter,
-      Level::kBest,
-      Level::kMax,
+      Level::kFastest, Level::kDefault, Level::kBetter,
+      Level::kBest,    Level::kMax,
   };
   const std::string original(4096, 'a');
 
@@ -67,6 +69,7 @@ TEST(ZstdCompressTest, EveryCompressionLevelSupportsRoundTrip) {
   }
 }
 
+// 验证二进制数据的每种字节值都能在压缩往返后保持不变。
 TEST(ZstdCompressTest, BinaryRoundTripPreservesEveryByteValue) {
   ZstdCompress& compressor = ZstdCompress::GetInstance();
   std::vector<char> original(256);
@@ -77,8 +80,8 @@ TEST(ZstdCompressTest, BinaryRoundTripPreservesEveryByteValue) {
   std::vector<char> decompressed;
 
   // 0 到 255 的全部字节值可覆盖文本测试无法覆盖的任意二进制内容。
-  ASSERT_TRUE(compressor.CompressData(original.data(), original.size(),
-                                      compressed));
+  ASSERT_TRUE(
+      compressor.CompressData(original.data(), original.size(), compressed));
   ASSERT_FALSE(compressed.empty());
   EXPECT_LE(compressed.size(), compressor.GetCompressBound(original.size()));
   ASSERT_TRUE(compressor.DecompressData(compressed.data(), compressed.size(),
@@ -86,6 +89,7 @@ TEST(ZstdCompressTest, BinaryRoundTripPreservesEveryByteValue) {
   EXPECT_EQ(decompressed, original);
 }
 
+// 验证空指针或零长度二进制输入安全处理并清空输出。
 TEST(ZstdCompressTest, EmptyBinaryInputClearsDestination) {
   ZstdCompress& compressor = ZstdCompress::GetInstance();
   const char placeholder = 'x';
@@ -105,6 +109,7 @@ TEST(ZstdCompressTest, EmptyBinaryInputClearsDestination) {
   EXPECT_TRUE(destination.empty());
 }
 
+// 验证非 ZSTD 帧输入被拒绝，不会伪装成成功解压结果。
 TEST(ZstdCompressTest, RejectsInvalidCompressedInput) {
   ZstdCompress& compressor = ZstdCompress::GetInstance();
   const std::string invalid_frame = "this is not a zstd frame";
@@ -117,6 +122,7 @@ TEST(ZstdCompressTest, RejectsInvalidCompressedInput) {
                                          invalid_frame.size(), data_output));
 }
 
+// 验证压缩结果不会超过库报告的最大边界。
 TEST(ZstdCompressTest, CompressBoundCanHoldCompressedOutput) {
   ZstdCompress& compressor = ZstdCompress::GetInstance();
   const std::string original(1024, 'z');

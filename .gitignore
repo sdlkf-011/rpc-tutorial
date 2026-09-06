@@ -40,5 +40,9 @@ Thumbs.db
 *.tmp
 *.swp
 
-# clangd
+# clang
 .clangd
+.clang-format
+
+# codex
+.cache

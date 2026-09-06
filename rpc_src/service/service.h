@@ -17,6 +17,6 @@ class Service {
   virtual bool HandleRequest(const std::string& method_name,
                              const std::string& args, std::string& result) = 0;
 };
-} // namespace cookrpc
+}  // namespace cookrpc
 
-#endif // RPC_TUTORIAL_RPC_SRC_SERVICE_SERVICE_H_
+#endif  // RPC_TUTORIAL_RPC_SRC_SERVICE_SERVICE_H_

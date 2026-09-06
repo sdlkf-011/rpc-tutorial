@@ -2,9 +2,9 @@
 
 #include <exception>
 #include <fstream>
-#include <string>
 #include <nlohmann/json.hpp>
-#include <nlohmann/json_fwd.hpp> 
+#include <nlohmann/json_fwd.hpp>
+#include <string>
 
 #include "log_manager.h"
 
@@ -54,4 +54,4 @@ bool RpcClientConfig::InitRpcClientConfig(const std::string& config_filename) {
   }
 }
 
-} // namespace cookrpc
+}  // namespace cookrpc
