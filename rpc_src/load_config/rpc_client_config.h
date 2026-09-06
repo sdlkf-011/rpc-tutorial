@@ -25,44 +25,33 @@ class RpcClientConfig {
   void SetServerPort(int server_port);
 
   // Getter 方法
-  const std::string& GetZkHost() const {
-    return zk_host_;
-  }
+  const std::string& GetZkHost() const { return zk_host_; }
 
-  const std::string& GetZkNamespace() const {
-    return zk_namespace_;
-  }
+  const std::string& GetZkNamespace() const { return zk_namespace_; }
 
-  int GetZkPort() const {
-    return zk_port_;
-  }
+  int GetZkPort() const { return zk_port_; }
 
-  int GetTimeout() const {
-    return timeout_ms_;
-  }
+  int GetTimeout() const { return timeout_ms_; }
 
-  int GetRetryTimes() const {
-    return retry_times_;
-  }
+  int GetRetryTimes() const { return retry_times_; }
 
-  int GetServerPort() const {
-    return server_port_;
-  }
+  int GetServerPort() const { return server_port_; }
 
   RpcClientConfig(const RpcClientConfig&) = delete;
   RpcClientConfig& operator=(const RpcClientConfig&) = delete;
   RpcClientConfig(RpcClientConfig&&) = delete;
   RpcClientConfig& operator=(RpcClientConfig&&) = delete;
+
  private:
   std::string zk_host_;
   std::string zk_namespace_;
   int zk_port_;
-  int timeout_ms_ = 3000; // 默认超时 3 秒
-  int retry_times_ = 3; // 默认重试 3 秒
+  int timeout_ms_ = 3000;  // 默认超时 3 秒
+  int retry_times_ = 3;    // 默认重试 3 秒
   int server_port_ = 0;
 
   RpcClientConfig() = default;
 };
-} // namespace cookrp
+}  // namespace cookrpc
 
-#endif // RPC_TUTORIAL_RPC_SRC_LOAD_CONFIG_RPC_CLIENT_CONFIG_H_
+#endif  // RPC_TUTORIAL_RPC_SRC_LOAD_CONFIG_RPC_CLIENT_CONFIG_H_

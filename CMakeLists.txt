@@ -11,18 +11,76 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # 查找依赖库
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
-find_package(Protobuf CONFIG REQUIRED)
-find_package(fmt CONFIG REQUIRED)
-find_package(spdlog CONFIG REQUIRED)
-find_package(nlohmann_json CONFIG REQUIRED)
-find_package(zstd CONFIG REQUIRED)
-find_package(unofficial-zookeeper CONFIG REQUIRED)
+
+# 优先使用包管理器提供的配置文件，同时兼容系统安装的 CMake 查找模块。
+find_package(Protobuf CONFIG QUIET)
+if(NOT TARGET protobuf::libprotobuf)
+  find_package(Protobuf MODULE REQUIRED)
+endif()
+
+find_package(fmt CONFIG QUIET)
+if(NOT TARGET fmt::fmt)
+  find_package(fmt REQUIRED)
+endif()
+
+find_package(spdlog CONFIG QUIET)
+if(NOT TARGET spdlog::spdlog)
+  find_package(spdlog REQUIRED)
+endif()
+
+find_package(nlohmann_json CONFIG QUIET)
+if(NOT TARGET nlohmann_json::nlohmann_json)
+  find_package(nlohmann_json REQUIRED)
+endif()
+
+find_package(zstd CONFIG QUIET)
+if(TARGET zstd::libzstd)
+  set(RPC_ZSTD_TARGET zstd::libzstd)
+elseif(TARGET zstd::libzstd_shared)
+  set(RPC_ZSTD_TARGET zstd::libzstd_shared)
+elseif(TARGET zstd::libzstd_static)
+  set(RPC_ZSTD_TARGET zstd::libzstd_static)
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+  set(RPC_ZSTD_TARGET PkgConfig::ZSTD)
+endif()
+
+find_package(unofficial-zookeeper CONFIG QUIET)
+if(TARGET unofficial::zookeeper::zookeeper)
+  set(RPC_ZOOKEEPER_TARGET unofficial::zookeeper::zookeeper)
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(ZOOKEEPER QUIET IMPORTED_TARGET zookeeper-mt)
+  if(NOT TARGET PkgConfig::ZOOKEEPER)
+    pkg_check_modules(ZOOKEEPER QUIET IMPORTED_TARGET zookeeper_mt)
+  endif()
+  if(TARGET PkgConfig::ZOOKEEPER)
+    set(RPC_ZOOKEEPER_TARGET PkgConfig::ZOOKEEPER)
+  else()
+    find_path(ZOOKEEPER_INCLUDE_DIR NAMES zookeeper/zookeeper.h)
+    find_library(ZOOKEEPER_LIBRARY NAMES zookeeper_mt zookeeper-mt zookeeper)
+    if(NOT ZOOKEEPER_INCLUDE_DIR OR NOT ZOOKEEPER_LIBRARY)
+      message(FATAL_ERROR
+        "ZooKeeper C client was not found; install zookeeper[sync] or the system development package")
+    endif()
+    add_library(rpc_zookeeper INTERFACE)
+    target_include_directories(rpc_zookeeper INTERFACE "${ZOOKEEPER_INCLUDE_DIR}")
+    target_link_libraries(rpc_zookeeper INTERFACE "${ZOOKEEPER_LIBRARY}")
+    set(RPC_ZOOKEEPER_TARGET rpc_zookeeper)
+  endif()
+endif()
 
 # ServiceRegistry 使用 ZooKeeper 同步 API；通过 vcpkg 安装时需要启用
-# zookeeper[sync] 特性。
+# zookeeper[sync] 特性
 include(CheckCXXSourceCompiles)
 set(CMAKE_REQUIRED_DEFINITIONS -DTHREADED)
-set(CMAKE_REQUIRED_LIBRARIES unofficial::zookeeper::zookeeper)
+set(CMAKE_REQUIRED_LIBRARIES ${RPC_ZOOKEEPER_TARGET})
+if(DEFINED ZOOKEEPER_INCLUDE_DIRS)
+  set(CMAKE_REQUIRED_INCLUDES ${ZOOKEEPER_INCLUDE_DIRS})
+elseif(DEFINED ZOOKEEPER_INCLUDE_DIR)
+  set(CMAKE_REQUIRED_INCLUDES ${ZOOKEEPER_INCLUDE_DIR})
+endif()
 check_cxx_source_compiles([[
   #include <zookeeper/zookeeper.h>
   int main() {
@@ -31,6 +89,7 @@ check_cxx_source_compiles([[
 ]] ZOOKEEPER_HAS_SYNC_API)
 unset(CMAKE_REQUIRED_DEFINITIONS)
 unset(CMAKE_REQUIRED_LIBRARIES)
+unset(CMAKE_REQUIRED_INCLUDES)
 if(NOT ZOOKEEPER_HAS_SYNC_API)
   message(FATAL_ERROR
     "ZooKeeper synchronous API is required; install zookeeper[sync]")
@@ -53,10 +112,8 @@ list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/load_balancer_test\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/zstd_compress_test\\.(cc|cpp)$")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/aes_encrypt_test\\.(cc|cpp)$")
 
-# 添加 protobuf 生成代码
-list(APPEND COMMON_SOURCES
-  "${PROJECT_SOURCE_DIR}/protos/message.pb.cc"
-)
+# 将协议定义文件加入构建输入；生成文件保留在构建目录，避免不同环境在源码目录留下过期文件。
+list(APPEND COMMON_SOURCES "${PROJECT_SOURCE_DIR}/protos/message.proto")
 
 # 创建公共静态库
 add_library(rpc_common STATIC ${COMMON_SOURCES})
@@ -77,8 +134,16 @@ target_include_directories(rpc_common
     ${PROJECT_SOURCE_DIR}/rpc_src/serializer
     ${PROJECT_SOURCE_DIR}/rpc_src/service
     ${PROJECT_SOURCE_DIR}/rpc_src/thread_pool
-    ${PROJECT_SOURCE_DIR}/protos
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
     ${PROJECT_SOURCE_DIR}/utils
+)
+
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+protobuf_generate(
+  TARGET rpc_common
+  LANGUAGE cpp
+  PROTOC_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated"
+  APPEND_PATH
 )
 
 # 链接公共依赖
@@ -90,8 +155,8 @@ target_link_libraries(rpc_common
     fmt::fmt
     spdlog::spdlog
     nlohmann_json::nlohmann_json
-    zstd::libzstd
-    unofficial::zookeeper::zookeeper
+    ${RPC_ZSTD_TARGET}
+    ${RPC_ZOOKEEPER_TARGET}
 )
 
 # 定义工程版本宏
@@ -156,7 +221,7 @@ enable_project_warnings(stress_test_client)
 include(CTest)
 
 if(BUILD_TESTING)
-  find_package(GTest CONFIG REQUIRED)
+  find_package(GTest REQUIRED)
 
   add_executable(load_balancer_test
     rpc_src/test/load_balancer_test.cc

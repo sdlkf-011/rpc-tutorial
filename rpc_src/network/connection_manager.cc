@@ -7,9 +7,11 @@
 
 namespace cookrpc {
 
+// 连接生命周期管理模块：集中维护 fd 到 Connection 的线程安全映射。
 ConnectionManager::~ConnectionManager() { CloseAll(); }
 
 void ConnectionManager::AddConnection(std::shared_ptr<Connection> conn) {
+  // 添加/替换模块：在锁内更新映射，锁外关闭被替换连接避免回调死锁。
   if (conn == nullptr || !conn->IsValid()) {
     return;
   }
@@ -35,6 +37,7 @@ void ConnectionManager::AddConnection(std::shared_ptr<Connection> conn) {
 }
 
 void ConnectionManager::RemoveConnection(int fd) {
+  // 删除模块：先从映射摘除连接，再在锁外执行关闭操作。
   std::shared_ptr<Connection> connection;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -52,6 +55,7 @@ void ConnectionManager::RemoveConnection(int fd) {
 }
 
 std::shared_ptr<Connection> ConnectionManager::GetConnection(int fd) {
+  // 查找模块：返回共享所有权，保证调用期间连接对象不会提前析构。
   std::lock_guard<std::mutex> lock(mutex_);
   const auto iterator = connections_.find(fd);
   return iterator == connections_.end() ? nullptr : iterator->second;
@@ -63,6 +67,7 @@ size_t ConnectionManager::GetConnectionCount() const {
 }
 
 void ConnectionManager::CloseAll() {
+  // 批量关闭模块：交换出映射后逐个关闭，缩短全局锁持有时间。
   std::unordered_map<int, std::shared_ptr<Connection>> connections;
   {
     std::lock_guard<std::mutex> lock(mutex_);

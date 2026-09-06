@@ -28,7 +28,7 @@ class ThreadPoolSingleton {
   static auto Enqueue(TaskPriority priority, F&& f, Args&&... args)
       -> std::future<std::invoke_result_t<F, Args...>> {
     return GetInstance().Enqueue(priority, std::forward<F>(f),
-                                  std::forward<Args>(args)...);
+                                 std::forward<Args>(args)...);
   }
 
   static ThreadPool::Stats GetStats();
@@ -51,7 +51,7 @@ class ThreadPoolSingleton {
   ThreadPoolSingleton() = default;
 
   static std::unique_ptr<ThreadPool> instance_;
-  static std::mutex mutex_; // 全局互斥锁
+  static std::mutex mutex_;  // 全局互斥锁
 };
 }  // namespace meeting_ctrl
 

@@ -1,20 +1,21 @@
 #ifndef RPC_TUTORIAL_RPC_SRC_COMPRESS_DATA_ZSTD_COMPRESS_H_
 #define RPC_TUTORIAL_RPC_SRC_COMPRESS_DATA_ZSTD_COMPRESS_H_
 
+#include <zstd.h>
+
 #include <cstddef>
 #include <string>
 #include <vector>
-#include <zstd.h>
 
 namespace cookrpc {
 
 // ZSTD 压缩级别
 enum class Level {
-  kFastest = 1, // 最快速
-  kDefault = 3, // 默认级别
-  kBetter = 7, // 较好压缩率
-  kBest = 19, // 最佳压缩率
-  kMax = 22 // 最大压缩率
+  kFastest = 1,  // 最快速
+  kDefault = 3,  // 默认级别
+  kBetter = 7,   // 较好压缩率
+  kBest = 19,    // 最佳压缩率
+  kMax = 22      // 最大压缩率
 };
 
 // Zstandard 压缩封装类
@@ -33,13 +34,12 @@ class ZstdCompress {
   bool DecompressString(const std::string& src, std::string& dst);
 
   // 压缩二进制数据
-  bool CompressData(const char* src, size_t src_len,
-                    std::vector<char>& dst, Level level = Level::kDefault);
+  bool CompressData(const char* src, size_t src_len, std::vector<char>& dst,
+                    Level level = Level::kDefault);
 
   // 解压二进制数据
-  bool DecompressData(const char* src, size_t src_len,
-                      std::vector<char>& dst);  
-                    
+  bool DecompressData(const char* src, size_t src_len, std::vector<char>& dst);
+
   // 获取压缩后的最大可能大小
   size_t GetCompressBound(size_t src_size) const {
     return ZSTD_compressBound(src_size);
@@ -49,10 +49,11 @@ class ZstdCompress {
   ZstdCompress& operator=(const ZstdCompress&) = delete;
   ZstdCompress(ZstdCompress&&) = delete;
   ZstdCompress& operator=(ZstdCompress&&) = delete;
+
  private:
   ZstdCompress() = default;
   ~ZstdCompress();
 };
-} // namespace cookrpc
+}  // namespace cookrpc
 
-#endif // RPC_TUTORIAL_RPC_SRC_COMPRESS_DATA_ZSTD_COMPRESS_H_
+#endif  // RPC_TUTORIAL_RPC_SRC_COMPRESS_DATA_ZSTD_COMPRESS_H_

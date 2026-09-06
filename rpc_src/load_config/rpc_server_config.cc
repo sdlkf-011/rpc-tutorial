@@ -1,14 +1,13 @@
 #include "rpc_server_config.h"
-#include "log_manager.h"
 
 #include <exception>
 #include <fstream>
+#include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
 #include <string>
-#include <nlohmann/json.hpp>
 
-#include "utils_fun.h"
 #include "log_manager.h"
+#include "utils_fun.h"
 
 namespace cookrpc {
 
@@ -17,7 +16,7 @@ bool RpcServerConfig::InitRpcServerConfig(const std::string& config_file) {
     // 打开文件
     std::ifstream file(config_file);
     if (!file.is_open()) {
-      LOG_ERROR("Failed to open config file: {}",config_file);
+      LOG_ERROR("Failed to open config file: {}", config_file);
       return false;
     }
 
@@ -53,20 +52,22 @@ bool RpcServerConfig::InitRpcServerConfig(const std::string& config_file) {
 
     // 初始化注册配置
     if (config.contains("register_config")) {
-      if (!service_registry_config_->
-          InitRegistryConfig(config.value("register_config", "../config/servers.json"))) {
+      if (!service_registry_config_->InitRegistryConfig(
+              config.value("register_config", "../config/servers.json"))) {
         LOG_ERROR("Failed to initialize registry config");
         return false;
       }
     }
 
-    LOG_INFO("RpcServer config loaded: name={}, ip={}, port={}, timeout={}ms, max_conn={}",
-             servers_name_prefix_, servers_ip_, servers_port_, timeout_, max_connections_
-    );
+    LOG_INFO(
+        "RpcServer config loaded: name={}, ip={}, port={}, timeout={}ms, "
+        "max_conn={}",
+        servers_name_prefix_, servers_ip_, servers_port_, timeout_,
+        max_connections_);
     return true;
   } catch (const std::exception& e) {
     LOG_ERROR("Error initializing server config: {}", e.what());
     return false;
   }
 }
-} // namespace cookrpc
+}  // namespace cookrpc

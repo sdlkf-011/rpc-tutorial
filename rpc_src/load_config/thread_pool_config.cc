@@ -3,7 +3,6 @@
 #include <exception>
 #include <nlohmann/json_fwd.hpp>
 
-
 #include "log_manager.h"
 
 namespace cookrpc {
@@ -18,7 +17,8 @@ bool ThreadPoolConfig::InitThreadPoolConfig(const nlohmann::json& config) {
 
     // 参数验证
     if (core_threads_ > max_threads_) {
-      LOG_ERROR("Core threads ({}) cannot exceed max threads ({})", core_threads_, max_threads_);
+      LOG_ERROR("Core threads ({}) cannot exceed max threads ({})",
+                core_threads_, max_threads_);
       return false;
     }
 
@@ -27,8 +27,9 @@ bool ThreadPoolConfig::InitThreadPoolConfig(const nlohmann::json& config) {
       return false;
     }
 
-    LOG_INFO("ThreadPool config loaded: max={}, queue={}, keepalive={}s, core={}",
-             max_threads_, queue_size_, keep_alive_time_, core_threads_);
+    LOG_INFO(
+        "ThreadPool config loaded: max={}, queue={}, keepalive={}s, core={}",
+        max_threads_, queue_size_, keep_alive_time_, core_threads_);
 
     return true;
   } catch (const std::exception& e) {
@@ -36,4 +37,4 @@ bool ThreadPoolConfig::InitThreadPoolConfig(const nlohmann::json& config) {
     return false;
   }
 }
-} // namespace cookrpc
+}  // namespace cookrpc

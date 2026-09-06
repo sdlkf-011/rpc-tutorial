@@ -2,10 +2,9 @@
 #define RPC_TUTORIAL_RPC_SRC_SERIALIZER_JSON_SERIALIZER_H_
 
 #include <exception>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <utility>
-
-#include <nlohmann/json.hpp>
 
 #include "log_manager.h"
 

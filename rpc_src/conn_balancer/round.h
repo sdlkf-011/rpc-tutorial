@@ -18,7 +18,7 @@ class RoundRobinLoadBalancer : public LoadBalancer {
   std::string Select(const std::vector<std::string>& instances) override {
     // 空列表检查
     if (instances.empty()) {
-      return  "";
+      return "";
     }
 
     // 获取当前索引并递增
@@ -27,9 +27,10 @@ class RoundRobinLoadBalancer : public LoadBalancer {
     // 返回对应实例
     return instances[index];
   }
- private:
-  std::atomic<size_t> current_index_; // 原子计数器
-};
-} // namespace cookrpc
 
-#endif // RPC_TUTORIAL_RPC_SRC_CONN_BALANCER_ROUND_H_
+ private:
+  std::atomic<size_t> current_index_;  // 原子计数器
+};
+}  // namespace cookrpc
+
+#endif  // RPC_TUTORIAL_RPC_SRC_CONN_BALANCER_ROUND_H_

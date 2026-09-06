@@ -8,38 +8,37 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <thread>
 
-#include <nlohmann/json.hpp>
-
-#include "zk_conn_handler.h"
-#include "rpc_service.h"
-#include "rpc_server_config.h"
-#include "log_manager.h"
 #include "create_socket.h"
+#include "log_manager.h"
 #include "message_cycle.h"
+#include "rpc_server_config.h"
+#include "rpc_service.h"
 #include "service_manager.h"
 #include "thread_pool_singleton.h"
+#include "zk_conn_handler.h"
 
 namespace {
 
 constexpr char kDefaultConfigPath[] = "../config/rpc_server.json";
 
+// 屏蔽终止信号，交由专用线程通过 sigwait 统一处理。
 bool BlockTerminationSignals(sigset_t& termination_signals) {
   sigemptyset(&termination_signals);
   sigaddset(&termination_signals, SIGINT);
   sigaddset(&termination_signals, SIGTERM);
-  const int result =
-      pthread_sigmask(SIG_BLOCK, &termination_signals, nullptr);
+  const int result = pthread_sigmask(SIG_BLOCK, &termination_signals, nullptr);
   if (result != 0) {
-    LOG_ERROR("Failed to block termination signals: {}",
-              std::strerror(result));
+    LOG_ERROR("Failed to block termination signals: {}", std::strerror(result));
     return false;
   }
   return true;
 }
 
+// 将项目线程池配置转换为线程池库所需的配置结构。
 meeting_ctrl::ThreadPoolStruct BuildThreadPoolConfig(
     const cookrpc::ThreadPoolConfig& config) {
   meeting_ctrl::ThreadPoolStruct thread_pool_config;
@@ -51,6 +50,7 @@ meeting_ctrl::ThreadPoolStruct BuildThreadPoolConfig(
   return thread_pool_config;
 }
 
+// 初始化 ZooKeeper 连接并发布配置中的 RPC 服务实例。
 bool InitializeServiceRegistry(
     const std::string& config_path,
     const cookrpc::ServiceRegistryConfig* registry_config) {
@@ -91,6 +91,7 @@ bool InitializeServiceRegistry(
   }
 }
 
+// 等待在途任务完成后，按顺序关闭并销毁线程池。
 void ShutdownThreadPool(uint32_t timeout_ms) {
   // 先等待在途请求，再销毁线程池。
   // 避免响应处理中途丢失。
@@ -124,9 +125,8 @@ int main(int argc, char* argv[]) {
   }
 
   const auto* thread_config = server_config.GetThreadPoolConfig();
-  if (thread_config == nullptr ||
-      !meeting_ctrl::ThreadPoolSingleton::Init(
-          BuildThreadPoolConfig(*thread_config))) {
+  if (thread_config == nullptr || !meeting_ctrl::ThreadPoolSingleton::Init(
+                                      BuildThreadPoolConfig(*thread_config))) {
     LOG_FATAL("Failed to initialize RPC worker thread pool");
     return 1;
   }
@@ -158,8 +158,8 @@ int main(int argc, char* argv[]) {
 
   // 监听就绪后再发布服务。
   // 防止客户端发现尚未可用的实例。
-  if (!InitializeServiceRegistry(
-          config_path, server_config.GetServiceRegistryConfig())) {
+  if (!InitializeServiceRegistry(config_path,
+                                 server_config.GetServiceRegistryConfig())) {
     LOG_FATAL("Failed to publish RPC service");
     meeting_ctrl::ThreadPoolSingleton::Destroy();
     return 1;

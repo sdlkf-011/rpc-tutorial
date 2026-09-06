@@ -1,9 +1,9 @@
 #include <netinet/tcp.h>
 #include <pthread.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
-#include <atomic>
 #include <mutex>
 #include <set>
 #include <string>
@@ -22,15 +22,18 @@
 #include "rpc_protocol.h"
 
 namespace cookrpc {
-  
+
+// 跨平台网络事件循环：统一处理监听 fd、客户端读事件及 RPC 分发。
 class MessageCycle {
  public:
   MessageCycle(ConnectionManager* manager);
   virtual ~MessageCycle();
-  
+
+  // 注册/注销监听文件描述符。
   bool AddListenFd(int fd);
   bool RemoveListenFd(int fd);
   size_t GetListenFdCount() const;
+  // 启动事件循环（通常在线程中调用）并停止循环。
   void Loop();
   void Stop();
   void HandleRpcRequest(const std::shared_ptr<Connection>& conn,
@@ -87,4 +90,4 @@ class MessageCycle {
   void HandleRpcRequestSync(const std::shared_ptr<Connection>& conn,
                             const RpcRequest& request);
 };
-} // namespace cookrpc
+}  // namespace cookrpc

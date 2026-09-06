@@ -1,11 +1,11 @@
 #ifndef RPC_TUTORIAL_RPC_SRC_SERIALIZER_PROTOBUF_SERIALIZER_H_
 #define RPC_TUTORIAL_RPC_SRC_SERIALIZER_PROTOBUF_SERIALIZER_H_
 
+#include <google/protobuf/message_lite.h>
+
 #include <exception>
 #include <memory>
 #include <string>
-
-#include <google/protobuf/message_lite.h>
 
 #include "log_manager.h"
 

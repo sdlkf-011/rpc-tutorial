@@ -22,6 +22,7 @@ class AesEncrypt {
 
   AesEncrypt(const AesEncrypt&) = delete;
   AesEncrypt& operator=(const AesEncrypt&) = delete;
+
  private:
   AesEncrypt();
   ~AesEncrypt();
@@ -30,12 +31,12 @@ class AesEncrypt {
   std::string Base64Encode(const std::string& input) const;
   std::string Base64Decode(const std::string& input) const;
 
-  static constexpr size_t KEY_LENGTH = 32; // AES-256 密钥长度
-  std::array<unsigned char, KEY_LENGTH> master_key_{}; // AES-256 主密钥
+  static constexpr size_t KEY_LENGTH = 32;              // AES-256 密钥长度
+  std::array<unsigned char, KEY_LENGTH> master_key_{};  // AES-256 主密钥
   bool key_initialized_ = false;
-  static constexpr size_t NONCE_LENGTH = 12; // GCM 推荐随机 nonce 长度
-  static constexpr size_t TAG_LENGTH = 16; // GCM 认证标签长度
+  static constexpr size_t NONCE_LENGTH = 12;  // GCM 推荐随机 nonce 长度
+  static constexpr size_t TAG_LENGTH = 16;    // GCM 认证标签长度
 };
-} // namespace cookrpc
+}  // namespace cookrpc
 
-#endif // RPC_TUTORIAL_RPC_SRC_ENCRYPT_AES_ENCRYPT_H_
+#endif  // RPC_TUTORIAL_RPC_SRC_ENCRYPT_AES_ENCRYPT_H_

@@ -8,10 +8,10 @@
 #include <string>
 #include <unordered_map>
 
+#include "log_manager.h"
 #include "random.h"
 #include "round.h"
 #include "weight.h"
-#include "log_manager.h"
 
 namespace cookrpc {
 
@@ -36,20 +36,18 @@ struct BalancerFactory {
   }
 
   // 获取工厂映射表
-  static const std::unordered_map<std::string, 
-                                  std::function<std::shared_ptr<LoadBalancer>()>>& 
+  static const std::unordered_map<
+      std::string, std::function<std::shared_ptr<LoadBalancer>()>>&
   GetMap() {
-    static const std::unordered_map<std::string, 
-                                    std::function<std::shared_ptr<LoadBalancer>()>> 
-    map = {
-      {"random", CreateRandom},
-      {"round", CreateRoundRobin},
-      {"weight", CreateWeighted}
-    };
+    static const std::unordered_map<
+        std::string, std::function<std::shared_ptr<LoadBalancer>()>>
+        map = {{"random", CreateRandom},
+               {"round", CreateRoundRobin},
+               {"weight", CreateWeighted}};
     return map;
   }
-}; 
-} // namespace
+};
+}  // namespace
 
 std::shared_ptr<LoadBalancer> LoadBalancer::GetInstance() {
   if (!instance_) {
@@ -90,7 +88,8 @@ bool LoadBalancer::InitBalancer(const std::string& type) {
   return false;
 }
 
-std::string LoadBalancer::SelectServer(const std::vector<std::string>& servers) {
+std::string LoadBalancer::SelectServer(
+    const std::vector<std::string>& servers) {
   // 确保初始化
   if (!instance_) {
     LOG_WARN("Load balancer not initialized, using default random balancer");
@@ -109,9 +108,9 @@ std::string LoadBalancer::SelectServer(const std::vector<std::string>& servers) 
   // 调用具体策略的 Select 方法
   try {
     return instance_->Select(servers);
-  } catch(std::exception& e) {
+  } catch (std::exception& e) {
     LOG_ERROR("Error in load balancer select: {}", e.what());
     return servers[0];
   }
 }
-} // namespace cookrpc
+}  // namespace cookrpc

@@ -1,10 +1,10 @@
 #ifndef RPC_TUTORIAL_RPC_SRC_SERIALIZER_SERIALIZER_MANAGER_H_
 #define RPC_TUTORIAL_RPC_SRC_SERIALIZER_SERIALIZER_MANAGER_H_
 
+#include <google/protobuf/message_lite.h>
+
 #include <string>
 #include <type_traits>
-
-#include <google/protobuf/message_lite.h>
 
 #include "json_serializer.h"
 #include "log_manager.h"

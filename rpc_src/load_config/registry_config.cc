@@ -2,9 +2,9 @@
 
 #include <exception>
 #include <fstream>
-#include <string>
-#include <nlohmann/json_fwd.hpp>
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
+#include <string>
 
 #include "log_manager.h"
 
@@ -27,7 +27,8 @@ bool ServiceRegistryConfig::InitRegistryConfig(const std::string& config_file) {
     SetServiceVersion(config.value("service_version", "1.0.0"));
 
     // 加载注册节点列表
-    if (config.contains("registry_nodes") && config["registry_nodes"].is_array()) {
+    if (config.contains("registry_nodes") &&
+        config["registry_nodes"].is_array()) {
       for (const auto& node : config["registry_nodes"]) {
         RegistryInfo info;
         info.address = node.value("address", "");
@@ -50,4 +51,4 @@ bool ServiceRegistryConfig::InitRegistryConfig(const std::string& config_file) {
     return false;
   }
 }
-} // namespace cookrpc
+}  // namespace cookrpc

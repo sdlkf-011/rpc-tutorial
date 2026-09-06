@@ -1,12 +1,12 @@
 #ifndef RPC_TUTORIAL_RPC_SRC_REGISTRY_SERVICE_REGISTRY_H_
 #define RPC_TUTORIAL_RPC_SRC_REGISTRY_SERVICE_REGISTRY_H_
 
+#include <zookeeper/zookeeper.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <string>
-
-#include <zookeeper/zookeeper.h>
 
 namespace cookrpc {
 

@@ -38,8 +38,9 @@ class ServiceManager {
                 error.what());
       return false;
     } catch (...) {
-      LOG_ERROR("Failed to get service name during registration: unknown "
-                "exception");
+      LOG_ERROR(
+          "Failed to get service name during registration: unknown "
+          "exception");
       return false;
     }
 
@@ -73,8 +74,7 @@ class ServiceManager {
 
   // 同步处理 RPC 请求
   bool HandleRpcRequest(const std::string& service_name,
-                        const std::string& method_name,
-                        const std::string& args,
+                        const std::string& method_name, const std::string& args,
                         std::string& result) {
     return HandleRpcRequestSync(service_name, method_name, args, result);
   }
@@ -106,8 +106,7 @@ class ServiceManager {
   // 同步处理 RPC 请求的内部实现
   bool HandleRpcRequestSync(const std::string& service_name,
                             const std::string& method_name,
-                            const std::string& args,
-                            std::string& result) {
+                            const std::string& args, std::string& result) {
     const std::shared_ptr<Service> service = GetService(service_name);
     if (service == nullptr) {
       result.clear();
@@ -135,6 +134,6 @@ class ServiceManager {
   // 互斥锁
   mutable std::mutex mutex_;
 };
-} // namespace cookrpc
+}  // namespace cookrpc
 
-#endif // RPC_TUTORIAL_RPC_SRC_SERVICE_SERVICE_MANAGER_H_
+#endif  // RPC_TUTORIAL_RPC_SRC_SERVICE_SERVICE_MANAGER_H_
