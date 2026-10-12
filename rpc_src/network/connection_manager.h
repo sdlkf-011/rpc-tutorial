@@ -1,3 +1,6 @@
+#ifndef RPC_TUTORIAL_RPC_SRC_NETWORK_CONNECTION_MANAGER_H_
+#define RPC_TUTORIAL_RPC_SRC_NETWORK_CONNECTION_MANAGER_H_
+
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -19,10 +22,12 @@ class ConnectionManager {
   void AddConnection(std::shared_ptr<Connection> conn);
   // 从管理器移除并关闭指定文件描述符的连接。
   void RemoveConnection(int fd);
+  void RemoveConnection(int fd, const std::shared_ptr<Connection>& expected);
   // 查找连接并返回共享所有权。
   std::shared_ptr<Connection> GetConnection(int fd);
   // 获取当前活动连接数量。
   size_t GetConnectionCount() const;
+  std::vector<std::shared_ptr<Connection>> GetConnections() const;
   // 关闭并清空全部活动连接。
   void CloseAll();
 
@@ -40,3 +45,4 @@ class ConnectionManager {
   mutable std::mutex mutex_;
 };
 }  // namespace cookrpc
+#endif

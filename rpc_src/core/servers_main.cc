@@ -93,11 +93,13 @@ bool InitializeServiceRegistry(
 
 // 等待在途任务完成后，按顺序关闭并销毁线程池。
 void ShutdownThreadPool(uint32_t timeout_ms) {
-  // 先等待在途请求，再销毁线程池。
-  // 避免响应处理中途丢失。
-  if (!meeting_ctrl::ThreadPoolSingleton::Shutdown(
+  meeting_ctrl::ThreadPoolSingleton::RequestShutdown();
+  if (!meeting_ctrl::ThreadPoolSingleton::WaitForTermination(
           std::chrono::milliseconds(timeout_ms))) {
-    LOG_WARN("Thread pool did not finish all tasks before shutdown");
+    // 普通 C++ 任务不能安全强停。保留其依赖资源，显式继续等待后再退出。
+    LOG_WARN(
+        "Thread pool shutdown timed out; waiting for accepted tasks to finish");
+    meeting_ctrl::ThreadPoolSingleton::WaitForTermination();
   }
   meeting_ctrl::ThreadPoolSingleton::Destroy();
 }
@@ -192,8 +194,8 @@ int main(int argc, char* argv[]) {
   pthread_kill(signal_thread.native_handle(), SIGTERM);
   signal_thread.join();
 
-  cookrpc::ZkConnHandler::GetInstance().CleanUp();
   ShutdownThreadPool(server_config.GetTimeout());
+  cookrpc::ZkConnHandler::GetInstance().CleanUp();
   LOG_INFO("RPC server stopped");
   return 0;
 }

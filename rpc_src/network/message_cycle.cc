@@ -7,9 +7,13 @@
 
 #include <cerrno>
 #include <cstring>
+#include <deque>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "log_manager.h"
 #include "service_manager.h"
@@ -17,6 +21,8 @@
 
 namespace cookrpc {
 namespace {
+
+constexpr uint64_t kListenTag = uint64_t{1} << 63;
 
 // 事件循环辅助模块：为监听和客户端 fd 统一配置非阻塞及 CLOEXEC。
 bool SetNonBlockingAndCloseOnExec(int fd) {
@@ -89,41 +95,97 @@ void ProcessRpcRequest(const std::shared_ptr<Connection>& connection,
 
 }  // namespace
 
+struct MessageCycle::Notifications {
+  std::mutex mutex;
+  std::deque<std::shared_ptr<Connection>> ready;
+  std::unordered_set<uint64_t> queued;
+  bool active = true;
+  int pipe_fds[2]{-1, -1};
+
+  Notifications() {
+    if (pipe(pipe_fds) != 0)
+      throw std::runtime_error("Failed to create event wakeup pipe");
+    if (!SetNonBlockingAndCloseOnExec(pipe_fds[0]) ||
+        !SetNonBlockingAndCloseOnExec(pipe_fds[1])) {
+      close(pipe_fds[0]);
+      close(pipe_fds[1]);
+      throw std::runtime_error("Failed to configure event wakeup pipe");
+    }
+  }
+  ~Notifications() {
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+  }
+  void Wake() {
+    const char byte = 1;
+    ssize_t rc;
+    do {
+      rc = write(pipe_fds[1], &byte, 1);
+    } while (rc < 0 && errno == EINTR);
+    // EAGAIN 表示已有唤醒数据待消费，无需等待。
+  }
+  bool Notify(const std::shared_ptr<Connection>& connection) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!active) return false;
+      if (queued.insert(connection->GetId()).second)
+        ready.push_back(connection);
+    }
+    Wake();
+    return true;
+  }
+  void DrainPipe() {
+    char bytes[1024];
+    while (read(pipe_fds[0], bytes, sizeof(bytes)) > 0) {
+    }
+  }
+};
+
 MessageCycle::MessageCycle(ConnectionManager* manager)
-    : thread_id_(),
+    : notifications_(std::make_shared<Notifications>()),
       running_(false),
 #ifdef __APPLE__
       kqueue_fd_(kqueue()),
 #else
       epoll_fd_(epoll_create1(EPOLL_CLOEXEC)),
 #endif
-      // 事件后端初始化模块：按平台创建 kqueue/epoll，并绑定连接管理器。
-      connection_manager_(manager == nullptr ? &ConnectionManager::GetInstance()
-                                             : manager) {
+      connection_manager_(manager ? manager
+                                  : &ConnectionManager::GetInstance()) {
 #ifdef __APPLE__
-  if (kqueue_fd_ < 0) {
-    LOG_ERROR("Failed to create kqueue: {}", std::strerror(errno));
+  struct kevent event;
+  EV_SET(&event, notifications_->pipe_fds[0], EVFILT_READ, EV_ADD | EV_ENABLE,
+         0, 0, nullptr);
+  if (kqueue_fd_ < 0 ||
+      kevent(kqueue_fd_, &event, 1, nullptr, 0, nullptr) < 0) {
+    if (kqueue_fd_ >= 0) close(kqueue_fd_);
+    throw std::runtime_error("Failed to initialize kqueue");
   }
 #else
-  if (epoll_fd_ < 0) {
-    LOG_ERROR("Failed to create epoll: {}", std::strerror(errno));
+  epoll_event event{};
+  event.events = EPOLLIN;
+  event.data.u64 = 0;
+  if (epoll_fd_ < 0 || epoll_ctl(epoll_fd_, EPOLL_CTL_ADD,
+                                 notifications_->pipe_fds[0], &event) < 0) {
+    if (epoll_fd_ >= 0) close(epoll_fd_);
+    throw std::runtime_error("Failed to initialize epoll");
   }
 #endif
 }
 
 MessageCycle::~MessageCycle() {
   Stop();
-  connection_manager_->CloseAll();
+  {
+    std::unique_lock<std::mutex> lock(loop_mutex_);
+    loop_cv_.wait(lock, [this] { return !running_.load(); });
+  }
+  {
+    std::lock_guard<std::mutex> lock(notifications_->mutex);
+    notifications_->active = false;
+  }
 #ifdef __APPLE__
-  if (kqueue_fd_ >= 0) {
-    close(kqueue_fd_);
-    kqueue_fd_ = -1;
-  }
+  close(kqueue_fd_);
 #else
-  if (epoll_fd_ >= 0) {
-    close(epoll_fd_);
-    epoll_fd_ = -1;
-  }
+  close(epoll_fd_);
 #endif
 }
 
@@ -144,7 +206,8 @@ bool MessageCycle::AddListenFd(int fd) {
     return false;
   }
   struct kevent event;
-  EV_SET(&event, fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr);
+  EV_SET(&event, fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0,
+         reinterpret_cast<void*>(kListenTag | static_cast<uint64_t>(fd)));
   if (kevent(kqueue_fd_, &event, 1, nullptr, 0, nullptr) < 0) {
     LOG_ERROR("Failed to add listen fd {} to kqueue: {}", fd,
               std::strerror(errno));
@@ -156,7 +219,7 @@ bool MessageCycle::AddListenFd(int fd) {
   }
   epoll_event event{};
   event.events = EPOLLIN;
-  event.data.fd = fd;
+  event.data.u64 = kListenTag | static_cast<uint64_t>(fd);
   if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event) < 0) {
     LOG_ERROR("Failed to add listen fd {} to epoll: {}", fd,
               std::strerror(errno));
@@ -200,115 +263,139 @@ size_t MessageCycle::GetListenFdCount() const {
 }
 
 void MessageCycle::Loop() {
-  // 主事件循环模块：等待 I/O 事件并分发到连接建立或数据处理路径。
   bool expected = false;
-  if (!running_.compare_exchange_strong(expected, true)) {
-    // 已有循环运行时拒绝重复启动，防止多个线程同时消费同一后端。
-    return;
-  }
-  thread_id_ = pthread_self();
-
+  if (!running_.compare_exchange_strong(expected, true)) return;
+  bool draining = false;
+  auto drain_deadline = std::chrono::steady_clock::time_point::max();
+  while (true) {
+    ProcessNotifications();
+    if (stop_requested_.load()) {
+      if (!draining) {
+        draining = true;
+        drain_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        std::vector<int> listeners;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          listeners.assign(listen_fds_.begin(), listen_fds_.end());
+        }
+        for (int fd : listeners) RemoveListenFd(fd);
+        std::vector<uint64_t> ids;
+        for (const auto& entry : clients_) ids.push_back(entry.first);
+        for (auto id : ids) UpdateInterest(id);
+      }
+      std::vector<uint64_t> idle;
+      for (const auto& entry : clients_)
+        if (entry.second.connection->IsIdle()) idle.push_back(entry.first);
+      for (auto id : idle) RemoveConnection(id);
+      if (clients_.empty() ||
+          std::chrono::steady_clock::now() >= drain_deadline)
+        break;
+    }
 #ifdef __APPLE__
-  if (kqueue_fd_ < 0) {
-    running_.store(false);
-    return;
-  }
-  struct kevent events[MAX_EVENTS];
-  while (running_.load()) {
-    timespec timeout{};
-    timeout.tv_nsec = 100 * 1000 * 1000;
-    // 定期超时返回使 Stop 无需额外唤醒 fd 也能及时生效。
-    const int event_count =
+    struct kevent events[MAX_EVENTS];
+    timespec timeout{0, 100 * 1000 * 1000};
+    const int count =
         kevent(kqueue_fd_, nullptr, 0, events, MAX_EVENTS, &timeout);
-    if (event_count < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      LOG_ERROR("kqueue wait failed: {}", std::strerror(errno));
-      break;
-    }
-    HandleKqueueEvents(events, event_count);
-  }
 #else
-  if (epoll_fd_ < 0) {
-    running_.store(false);
-    return;
-  }
-  epoll_event events[MAX_EVENTS];
-  while (running_.load()) {
-    // 100ms 超时兼顾事件响应速度和停止标志检查。
-    const int event_count = epoll_wait(epoll_fd_, events, MAX_EVENTS, 100);
-    if (event_count < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      LOG_ERROR("epoll wait failed: {}", std::strerror(errno));
+    epoll_event events[MAX_EVENTS];
+    const int count = epoll_wait(epoll_fd_, events, MAX_EVENTS, 100);
+#endif
+    if (count < 0) {
+      if (errno == EINTR) continue;
+      LOG_ERROR("Event wait failed: {}", std::strerror(errno));
       break;
     }
-    HandleEpollEvents(events, event_count);
-  }
+#ifdef __APPLE__
+    HandleKqueueEvents(events, count);
+#else
+    HandleEpollEvents(events, count);
 #endif
-  running_.store(false);
+  }
+  while (!clients_.empty()) RemoveConnection(clients_.begin()->first);
+  {
+    std::lock_guard<std::mutex> lock(notifications_->mutex);
+    notifications_->active = false;
+    notifications_->ready.clear();
+    notifications_->queued.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(loop_mutex_);
+    running_.store(false);
+  }
+  loop_cv_.notify_all();
 }
 
-void MessageCycle::Stop() { running_.store(false); }
+void MessageCycle::Stop() {
+  stop_requested_.store(true);
+  notifications_->Wake();
+}
+
+void MessageCycle::ProcessNotifications() {
+  std::deque<std::shared_ptr<Connection>> ready;
+  {
+    std::lock_guard<std::mutex> lock(notifications_->mutex);
+    ready.swap(notifications_->ready);
+    notifications_->queued.clear();
+  }
+  for (const auto& connection : ready) {
+    // 对象标识和 epoll/kqueue 中的标识一致；旧 fd 或旧回调不作用于新连接。
+    const auto found = clients_.find(connection->GetId());
+    if (found != clients_.end() && found->second.connection == connection)
+      FlushConnection(found->first);
+  }
+}
 
 #ifdef __APPLE__
-void MessageCycle::HandleKqueueEvents(struct kevent* events, int nfds) {
-  for (int index = 0; index < nfds; ++index) {
-    const int fd = static_cast<int>(events[index].ident);
-    bool is_listen_fd = false;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      is_listen_fd = listen_fds_.find(fd) != listen_fds_.end();
-    }
-    if ((events[index].flags & EV_ERROR) != 0) {
-      RemoveInvalidFileDescriptor(fd);
-    } else if (is_listen_fd) {
-      HandleNewConnection(fd);
-    } else if (events[index].filter == EVFILT_READ &&
-               (events[index].data > 0 ||
-                (events[index].flags & EV_EOF) == 0)) {
-      HandleClientData(fd);
-    }
-    if (!is_listen_fd && (events[index].flags & EV_EOF) != 0) {
-      RemoveConnection(fd);
-    }
-  }
-}
-#else
-void MessageCycle::HandleEpollEvents(struct epoll_event* events, int nfds) {
-  for (int index = 0; index < nfds; ++index) {
-    const int fd = events[index].data.fd;
-    bool is_listen_fd = false;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      is_listen_fd = listen_fds_.find(fd) != listen_fds_.end();
-    }
-
-    if (is_listen_fd) {
-      if ((events[index].events & EPOLLIN) != 0) {
-        HandleNewConnection(fd);
-      }
-      if ((events[index].events & (EPOLLERR | EPOLLHUP)) != 0) {
-        RemoveInvalidFileDescriptor(fd);
-      }
+void MessageCycle::HandleKqueueEvents(struct kevent* events, int count) {
+  for (int i = 0; i < count; ++i) {
+    const uint64_t id = reinterpret_cast<uintptr_t>(events[i].udata);
+    if (id == 0) {
+      notifications_->DrainPipe();
       continue;
     }
-
-    if ((events[index].events & EPOLLIN) != 0) {
-      HandleClientData(fd);
+    if (id & kListenTag) {
+      const int fd = static_cast<int>(id & ~kListenTag);
+      if (!stop_requested_.load() && !(events[i].flags & EV_ERROR))
+        HandleNewConnection(fd);
+      continue;
     }
-    if ((events[index].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0) {
-      RemoveConnection(fd);
+    if (clients_.find(id) == clients_.end()) continue;
+    if (events[i].filter == EVFILT_READ && !stop_requested_.load())
+      HandleClientData(id);
+    if (events[i].filter == EVFILT_WRITE) FlushConnection(id);
+    if (events[i].flags & EV_ERROR) RemoveConnection(id);
+  }
+}
+#else
+void MessageCycle::HandleEpollEvents(struct epoll_event* events, int count) {
+  for (int i = 0; i < count; ++i) {
+    const uint64_t id = events[i].data.u64;
+    const uint32_t flags = events[i].events;
+    if (id == 0) {
+      notifications_->DrainPipe();
+      continue;
     }
+    if (id & kListenTag) {
+      const int fd = static_cast<int>(id & ~kListenTag);
+      if (!stop_requested_.load() && (flags & EPOLLIN)) HandleNewConnection(fd);
+      if (flags & (EPOLLERR | EPOLLHUP)) RemoveListenFd(fd);
+      continue;
+    }
+    if (clients_.find(id) == clients_.end()) continue;
+    // 可读与挂断一起发生时先读取，EOF 由 Connection 显式报告。
+    if (!stop_requested_.load() &&
+        (flags & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)))
+      HandleClientData(id);
+    if (flags & EPOLLOUT) FlushConnection(id);
+    if (flags & EPOLLERR) RemoveConnection(id);
   }
 }
 #endif
 
 void MessageCycle::HandleNewConnection(int fd) {
   // 新连接模块：排空监听队列，配置客户端 fd，注册回调后加入事件循环。
-  while (running_.load()) {
+  while (running_.load() && !stop_requested_.load()) {
     int client_fd = -1;
     do {
       client_fd = accept(fd, nullptr, nullptr);
@@ -355,65 +442,117 @@ void MessageCycle::HandleNewConnection(int fd) {
     connection->SetMessageCallback(
         [this](const std::shared_ptr<Connection>& conn,
                const RpcRequest& request) { HandleRpcRequest(conn, request); });
-    connection->SetCloseCallback(
-        [this](const std::shared_ptr<Connection>& conn) {
-          RemoveConnection(conn->GetFd());
+    const auto notifications = notifications_;
+    connection->SetEventCallback(
+        [notifications](const std::shared_ptr<Connection>& conn) {
+          return notifications->Notify(conn);
         });
-
-#ifdef __APPLE__
-    struct kevent event;
-    EV_SET(&event, client_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr);
-    if (kevent(kqueue_fd_, &event, 1, nullptr, 0, nullptr) < 0) {
-      LOG_ERROR("Failed to add client fd {} to kqueue: {}", client_fd,
-                std::strerror(errno));
-      connection->Close();
+    const uint64_t id = connection->GetId();
+    clients_.emplace(id, Client{connection, false, false, false});
+    if (!UpdateInterest(id)) {
+      RemoveConnection(id);
       continue;
     }
-#else
-    epoll_event event{};
-    event.events = EPOLLIN | EPOLLRDHUP;
-    event.data.fd = client_fd;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &event) < 0) {
-      LOG_ERROR("Failed to add client fd {} to epoll: {}", client_fd,
-                std::strerror(errno));
-      connection->Close();
-      continue;
-    }
-#endif
     connection_manager_->AddConnection(std::move(connection));
   }
 }
 
-void MessageCycle::HandleClientData(int fd) {
-  // 客户端读事件模块：取出连接并读取数据，失败时统一移除连接。
-  const std::shared_ptr<Connection> connection =
-      connection_manager_->GetConnection(fd);
-  if (connection == nullptr || !connection->Read()) {
-    RemoveConnection(fd);
+void MessageCycle::HandleClientData(uint64_t id) {
+  const auto found = clients_.find(id);
+  if (found == clients_.end()) return;
+  const auto connection = found->second.connection;
+  const auto result = connection->Read();
+  if (result.error || connection->ShouldClose()) {
+    RemoveConnection(id);
+    return;
   }
+  if (result.eof && !UpdateInterest(id)) RemoveConnection(id);
 }
 
-void MessageCycle::RemoveConnection(int fd) {
-  // 客户端移除模块：先从事件后端注销，再交给连接管理器关闭。
-#ifdef __APPLE__
-  if (kqueue_fd_ >= 0 && fd >= 0) {
-    struct kevent event;
-    EV_SET(&event, fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-    if (kevent(kqueue_fd_, &event, 1, nullptr, 0, nullptr) < 0 &&
-        errno != ENOENT && errno != EBADF) {
-      LOG_WARN("Failed to remove client fd {} from kqueue: {}", fd,
-               std::strerror(errno));
-    }
+void MessageCycle::FlushConnection(uint64_t id) {
+  const auto found = clients_.find(id);
+  if (found == clients_.end()) return;
+  const auto connection = found->second.connection;
+  if (connection->ShouldClose() ||
+      connection->FlushWrites(kSendBudget) == Connection::FlushResult::kError ||
+      connection->ShouldClose()) {
+    RemoveConnection(id);
+    return;
   }
+  if (!UpdateInterest(id)) RemoveConnection(id);
+}
+
+bool MessageCycle::UpdateInterest(uint64_t id) {
+  auto found = clients_.find(id);
+  if (found == clients_.end()) return false;
+  auto& client = found->second;
+  const int fd = client.connection->GetFd();
+  const bool read = !stop_requested_.load() && !client.connection->HasReadEof();
+  const bool write = client.connection->PendingWriteBytes() != 0;
+#ifdef __APPLE__
+  struct kevent changes[2];
+  int count = 0;
+  if (read != client.read_enabled) {
+    EV_SET(&changes[count], fd, EVFILT_READ,
+           read ? EV_ADD | EV_ENABLE : EV_DELETE, 0, 0,
+           reinterpret_cast<void*>(id));
+    ++count;
+  }
+  if (write != client.write_enabled) {
+    EV_SET(&changes[count], fd, EVFILT_WRITE,
+           write ? EV_ADD | EV_ENABLE : EV_DELETE, 0, 0,
+           reinterpret_cast<void*>(id));
+    ++count;
+  }
+  if (count && kevent(kqueue_fd_, changes, count, nullptr, 0, nullptr) < 0)
+    return false;
 #else
-  if (epoll_fd_ >= 0 && fd >= 0 &&
-      epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) < 0 && errno != ENOENT &&
-      errno != EBADF) {
-    LOG_WARN("Failed to remove client fd {} from epoll: {}", fd,
-             std::strerror(errno));
+  if (!read && !write) {
+    if (client.subscribed &&
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) < 0)
+      return false;
+    client.subscribed = false;
+  } else {
+    epoll_event event{};
+    event.events = (read ? uint32_t{EPOLLIN | EPOLLRDHUP} : 0u) |
+                   (write ? uint32_t{EPOLLOUT} : 0u);
+    event.data.u64 = id;
+    if (epoll_ctl(epoll_fd_, client.subscribed ? EPOLL_CTL_MOD : EPOLL_CTL_ADD,
+                  fd, &event) < 0)
+      return false;
+    client.subscribed = true;
   }
 #endif
-  connection_manager_->RemoveConnection(fd);
+  client.read_enabled = read;
+  client.write_enabled = write;
+  return true;
+}
+
+void MessageCycle::RemoveConnection(uint64_t id) {
+  const auto found = clients_.find(id);
+  if (found == clients_.end()) return;
+  const auto connection = found->second.connection;
+  const int fd = connection->GetFd();
+#ifdef __APPLE__
+  struct kevent changes[2];
+  int count = 0;
+  if (found->second.read_enabled) {
+    EV_SET(&changes[count], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+    ++count;
+  }
+  if (found->second.write_enabled) {
+    EV_SET(&changes[count], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+    ++count;
+  }
+  if (count) kevent(kqueue_fd_, changes, count, nullptr, 0, nullptr);
+#else
+  if (found->second.subscribed)
+    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+#endif
+  clients_.erase(found);
+  connection->SetMessageCallback(nullptr);
+  connection->CloseFromEventLoop();
+  connection_manager_->RemoveConnection(fd, connection);
 }
 
 void MessageCycle::RemoveInvalidFileDescriptor(int fd) {
@@ -426,7 +565,8 @@ void MessageCycle::RemoveInvalidFileDescriptor(int fd) {
   if (is_listen_fd) {
     RemoveListenFd(fd);
   } else {
-    RemoveConnection(fd);
+    const auto connection = connection_manager_->GetConnection(fd);
+    if (connection) RemoveConnection(connection->GetId());
   }
 }
 
@@ -446,10 +586,17 @@ void MessageCycle::HandleRpcRequest(const std::shared_ptr<Connection>& conn,
 void MessageCycle::HandleRpcRequestAsync(
     const std::shared_ptr<Connection>& conn, const RpcRequest& request) {
   // 异步请求模块：将业务处理投递线程池，避免事件线程被慢请求阻塞。
+  conn->BeginRequest();
   std::future<void> task = meeting_ctrl::ThreadPoolSingleton::Enqueue(
-      meeting_ctrl::TaskPriority::kNormal,
-      [conn, request] { ProcessRpcRequest(conn, request); });
+      meeting_ctrl::TaskPriority::kNormal, [conn, request] {
+        struct Done {
+          std::shared_ptr<Connection> conn;
+          ~Done() { conn->FinishRequest(); }
+        } done{conn};
+        ProcessRpcRequest(conn, request);
+      });
   if (!task.valid()) {
+    conn->FinishRequest();
     // 线程池拒绝任务时立即返回服务不可用，避免客户端无限等待。
     SendErrorResponse(conn, request.GetSequenceId(),
                       ErrorCode::kServiceUnavailable,
@@ -490,7 +637,7 @@ void MessageCycle::SendResponse(const std::shared_ptr<Connection>& conn,
     LOG_ERROR("Failed to send {} RPC response", response_type);
     return;
   }
-  LOG_DEBUG("Sent {} RPC response with sequence id {}", response_type,
+  LOG_DEBUG("Queued {} RPC response with sequence id {}", response_type,
             response.GetSequenceId());
 }
 }  // namespace cookrpc

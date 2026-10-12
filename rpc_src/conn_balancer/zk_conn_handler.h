@@ -1,8 +1,6 @@
 #ifndef RPC_TUTORIAL_RPC_SRC_CONN_BALANCER_ZK_CONN_HANDLER_H_
 #define RPC_TUTORIAL_RPC_SRC_CONN_BALANCER_ZK_CONN_HANDLER_H_
 
-#include <atomic>
-#include <chrono>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json_fwd.hpp>
@@ -23,9 +21,6 @@ extern "C" {
 
 #include "service_registry.h"
 
-// 前置声明
-class LoadBalancer;
-
 namespace cookrpc {
 
 // 前置声明
@@ -34,6 +29,9 @@ class ServiceRegistryConfig;
 // ZooKeeper 连接处理器
 class ZkConnHandler {
  public:
+  // 客户端独占发现器；服务端入口仍可使用下面的单例
+  ZkConnHandler() = default;
+
   // 获取单例实例
   static ZkConnHandler& GetInstance() {
     static ZkConnHandler instance;
@@ -81,7 +79,8 @@ class ZkConnHandler {
   // 获取或创建 ServiceRegistry 实例
   std::shared_ptr<ServiceRegistry> GetOrCreateServiceRegistry();
 
-  // 配置设置
+  // 设置待连接配置；EnsureZkConnection 首次连接时使用
+  // 已连接会话的配置切换必须通过 InitZkConnHandler 事务提交
   void SetZkHost(const std::string& host);
   void SetZkPort(int port);
   void SetZkRetryInterval(int seconds);
@@ -90,41 +89,38 @@ class ZkConnHandler {
   // 确保 ZooKeeper 连接可用
   bool EnsureZkConnection();
 
-  // 从 ZooKeeper 更新服务器列表
-  void UpdateServersFromZk(const std::string& zk_namespace);
-
   // 清除资源
   void CleanUp();
 
   ~ZkConnHandler();
 
  private:
-  ZkConnHandler()
-      : running_(false), zk_client_(nullptr), service_registry_(nullptr) {}
+  struct Configuration {
+    std::string host = "localhost";
+    int port = 2181;
+    std::string zk_namespace = "/cookrpc";
+    int retry_interval_seconds = 5;
+
+    std::string Endpoint() const;
+    bool IsValid() const;
+  };
+
+  // 句柄和 watcher 上下文一起存活，最后一个查询释放快照后关闭
+  struct Session;
 
   // 全局 Watcher 回调函数
   static void GlobalWatcher(zhandle_t* zh, int type, int state,
                             const char* path, void* watcherCtx);
 
-  // 创建 ServiceRegistry 实例
-  bool CreateServiceRegistryIfNeeded();
+  static std::shared_ptr<Session> CreateSession(const Configuration& config);
+  bool CommitConfiguration(Configuration config);
+  std::shared_ptr<Session> GetConnectedSession();
 
-  // 初始化 ZooKeeper 客户端
-  bool InitZkClient();
-
-  std::atomic<bool> running_;            // 运行状态
-  std::chrono::seconds retry_interval_;  // 重试间隔
-
-  mutable std::mutex mutex_;  // 保护成员变量和 ZooKeeper 客户端生命周期
-  std::mutex servers_mutex_;          // 保护服务器列表
-  std::vector<std::string> servers_;  // 缓存的服务器列表
-
-  zhandle_t* zk_client_;  // Zookeeper 服务端句柄
-
-  // 参数配置
-  std::string zk_host_;       // Zookeeper 主机地址
-  int zk_port_;               // Zookeeper 端口
-  std::string zk_namespace_;  // 命名空间
+  mutable std::mutex mutex_;  // 保护配置、会话和注册器快照
+  std::mutex update_mutex_;   // 串行化配置事务、惰性创建和清理
+  Configuration config_;
+  Configuration pending_config_;
+  std::shared_ptr<Session> session_;
 
   std::shared_ptr<ServiceRegistry> service_registry_;  // ServiceRegistry实例
 };

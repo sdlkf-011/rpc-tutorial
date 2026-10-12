@@ -6,18 +6,39 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <string>
+#include <utility>
 
+#include "error_code.h"
 #include "log_manager.h"
 
 namespace cookrpc {
 namespace {
 
 // 帧解析辅助模块：读取 RPC 头部中的网络字节序整数。
-constexpr size_t kHeaderSize = 3 * sizeof(uint32_t);
+constexpr size_t kHeaderSize = RpcHeader::kHeaderSize;
+std::atomic<uint64_t> next_connection_id{1};
+#ifdef MSG_NOSIGNAL
+constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+constexpr int kSendFlags = 0;
+#endif
+int RemainingMs(std::chrono::steady_clock::time_point deadline) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) return 0;
+  const auto remaining =
+      std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+  return static_cast<int>(
+      std::min<int64_t>(std::max<int64_t>(1, remaining.count()),
+                        std::numeric_limits<int>::max()));
+}
 
 uint32_t ReadNetworkUint32(const char* data) {
   const auto* bytes = reinterpret_cast<const unsigned char*>(data);
@@ -28,7 +49,7 @@ uint32_t ReadNetworkUint32(const char* data) {
 }
 }  // namespace
 
-Connection::Connection(int fd) : fd_(fd) {
+Connection::Connection(int fd) : fd_(fd), id_(next_connection_id.fetch_add(1)) {
   // 连接初始化模块：配置非阻塞属性，读取对端地址并进入已连接状态。
   if (fd_ < 0) {
     return;
@@ -94,152 +115,235 @@ Connection::~Connection() {
   state_ = State::DISCONNECTED;
 }
 
-bool Connection::Read() {
-  // 非阻塞接收模块：持续读取可用数据，累积到缓冲区后解析完整帧。
+Connection::ReadResult Connection::Read() {
   std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+  ReadResult result;
   if (!IsValid()) {
-    return false;
+    result.error = true;
+    return result;
   }
-
+  if (read_eof_) {
+    result.eof = true;
+    return result;
+  }
   char buffer[MAX_BUFFER_SIZE];
-  while (true) {
-    // 一次事件可能对应多次 recv，循环直到内核返回 EAGAIN。
-    const ssize_t bytes_read = recv(fd_, buffer, sizeof(buffer), 0);
-    if (bytes_read > 0) {
-      // TCP 是字节流，单次 recv 可能只得到半帧或多帧，必须先累计。
-      read_buffer_.insert(read_buffer_.end(), buffer, buffer + bytes_read);
-      if (message_callback_ != nullptr) {
-        if (!ProcessMessage()) {
-          return false;
-        }
-      } else if (read_buffer_.size() > MAX_MESSAGE_SIZE + kHeaderSize) {
-        // 没有消息回调时仍限制缓冲增长，防止恶意客户端耗尽内存。
-        LOG_ERROR("Read buffer from {}:{} exceeds maximum message size",
-                  peer_addr_, peer_port_);
-        HandleError();
-        return false;
+  // 每轮限制接收量；LT 后端将在下一轮继续报告可读。
+  constexpr size_t kReadBudget = 256 * 1024;
+  while (result.bytes_received < kReadBudget) {
+    size_t capacity =
+        std::min(sizeof(buffer), kReadBudget - result.bytes_received);
+    if (!message_callback_) {
+      capacity =
+          std::min(capacity, RpcHeader::kMaxFrameSize - read_buffer_.size());
+      if (capacity == 0) return result;
+    }
+    const ssize_t received = recv(fd_, buffer, capacity, 0);
+    if (received > 0) {
+      result.bytes_received += static_cast<size_t>(received);
+      read_buffer_.insert(read_buffer_.end(), buffer, buffer + received);
+      if (message_callback_ && !ProcessMessage()) {
+        result.error = true;
+        return result;
       }
       continue;
     }
-
-    if (bytes_read == 0) {
-      // 对端有序关闭，立即进入统一关闭流程并通知上层。
-      Close();
-      return false;
+    if (received == 0) {
+      read_eof_ = result.eof = true;
+      return result;
     }
-    if (errno == EINTR) {
-      // 系统调用被信号打断时重试，不把瞬时中断误判为网络故障。
-      continue;
-    }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      return true;
-    }
-
-    LOG_ERROR("Failed to receive data from {}:{}: {}", peer_addr_, peer_port_,
-              std::strerror(errno));
-    HandleError();
-    return false;
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return result;
+    result.error = true;
+    return result;
   }
+  return result;
 }
 
-bool Connection::ReadWithTimeout(int timeout_ms) {
-  // 超时读取模块：先用 poll 等待可读事件，再复用 Read 完成接收解析。
+Connection::ReadResult Connection::ReadWithTimeout(int timeout_ms) {
   std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+  ReadResult result;
   if (!IsValid() || timeout_ms < 0) {
-    return false;
+    result.error = true;
+    return result;
   }
-
-  pollfd descriptor{};
-  descriptor.fd = fd_;
-  descriptor.events = POLLIN;
-  int result = 0;
+  if (read_eof_) {
+    result.eof = true;
+    return result;
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  pollfd descriptor{fd_, POLLIN, 0};
+  int rc;
   do {
-    result = poll(&descriptor, 1, timeout_ms);
-  } while (result < 0 && errno == EINTR);
+    rc = poll(&descriptor, 1, RemainingMs(deadline));
+  } while (rc < 0 && errno == EINTR && RemainingMs(deadline) > 0);
+  if (rc == 0) {
+    result.timeout = true;
+    return result;
+  }
+  if (rc < 0 || (descriptor.revents & POLLNVAL)) {
+    result.error = true;
+    return result;
+  }
+  // HUP/ERR 可能与尚未读取的数据一起出现，先 recv 再解释 EOF 或错误。
+  if (descriptor.revents & (POLLIN | POLLHUP | POLLERR)) return Read();
+  result.timeout = true;
+  return result;
+}
 
-  if (result == 0) {
-    // 超时不视为连接错误，由调用方决定后续重试或关闭。
-    return false;
+void Connection::SetEventCallback(EventCallback callback) {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+  event_managed_ = true;
+  event_callback_ = std::move(callback);
+}
+
+bool Connection::NotifyEvent() {
+  EventCallback callback;
+  {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    callback = event_callback_;
   }
-  if (result < 0 || (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
-    // poll 错误、挂断或无效 fd 均表示连接不可继续使用。
-    HandleError();
-    return false;
+  const auto self = weak_from_this().lock();
+  return callback && self && callback(self);
+}
+
+bool Connection::QueueFrame(std::string data) {
+  bool accepted = false;
+  {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    if (!IsValid()) return false;
+    if (write_frames_.size() >= kMaxWriteFrames ||
+        data.size() > kMaxWriteBytes - write_bytes_) {
+      // 容量不足时关闭慢连接；不接受一半帧，也不无限占用工作线程。
+      close_requested_ = true;
+    } else {
+      write_frames_.push_back(std::move(data));
+      write_bytes_ += write_frames_.back().size();
+      accepted = true;
+    }
   }
-  return (descriptor.revents & POLLIN) != 0 && Read();
+  return NotifyEvent() && accepted;
 }
 
 bool Connection::Write(const std::string& data) {
-  // 发送缓冲模块：追加待发数据，并处理部分写入和暂时不可写情况。
-  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
-  if (data.empty()) {
-    return IsValid();
+  bool managed;
+  {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    managed = event_managed_;
   }
-
-  if (!IsValid()) {
-    return false;
+  if (!managed) return WriteWithTimeout(data, 3000);
+  if (data.size() >= kHeaderSize &&
+      ReadNetworkUint32(data.data()) == RpcHeader::MAGIC &&
+      ReadNetworkUint32(data.data() + sizeof(uint32_t)) ==
+          data.size() - kHeaderSize &&
+      data.size() > RpcHeader::kMaxFrameSize) {
+    RpcResponse error;
+    error.SetSequenceId(ReadNetworkUint32(data.data() + 2 * sizeof(uint32_t)));
+    error.SetErrorCode(static_cast<uint32_t>(ErrorCode::kProtocolError));
+    error.SetErrorMessage("RPC response exceeds the 1 MiB body limit");
+    std::string frame;
+    return error.SerializeForSend(frame) && QueueFrame(std::move(frame));
   }
-  try {
-    // 先复制到缓冲区再发送，兼容 send 只写出部分数据的情况。
-    write_buffer_.insert(write_buffer_.end(), data.begin(), data.end());
-  } catch (...) {
-    LOG_ERROR("Failed to buffer outgoing data for {}:{}", peer_addr_,
-              peer_port_);
-    return false;
-  }
-  return SendInBuffer();
+  RpcResponse response;
+  // 原始帧入口也必须遵守协议长度与字段校验，不允许绕过响应检查。
+  return response.Deserialize(data) && QueueFrame(data);
 }
 
 bool Connection::Write(const RpcResponse& response) {
   std::string data;
-  if (!response.Serialize(data)) {
-    return false;
-  }
-  return Write(data);
+  return response.SerializeForSend(data) && Write(data);
 }
 
-bool Connection::SendInBuffer() {
-  // 缓冲刷新模块：循环 send 直到全部发送，必要时等待 POLLOUT 事件。
+bool Connection::WriteWithTimeout(const std::string& data, int timeout_ms) {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+  if (event_managed_ || !IsValid() || timeout_ms < 0 ||
+      data.size() > RpcHeader::kMaxFrameSize)
+    return false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
   size_t offset = 0;
-  while (offset < write_buffer_.size()) {
-#ifdef MSG_NOSIGNAL
-    constexpr int kSendFlags = MSG_NOSIGNAL;
-#else
-    constexpr int kSendFlags = 0;
-#endif
-    const ssize_t bytes_sent = send(fd_, write_buffer_.data() + offset,
-                                    write_buffer_.size() - offset, kSendFlags);
-    if (bytes_sent > 0) {
-      offset += static_cast<size_t>(bytes_sent);
+  while (offset < data.size()) {
+    if (RemainingMs(deadline) == 0) {
+      Close();
+      return false;
+    }
+    const ssize_t sent =
+        send(fd_, data.data() + offset, data.size() - offset, kSendFlags);
+    if (sent > 0) {
+      offset += static_cast<size_t>(sent);
       continue;
     }
-    if (bytes_sent < 0 && errno == EINTR) {
-      continue;
-    }
-    if (bytes_sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      // 发送缓冲已满时等待最多一秒可写，避免忙等占用 CPU。
-      pollfd descriptor{};
-      descriptor.fd = fd_;
-      descriptor.events = POLLOUT;
-      int poll_result = 0;
+    if (sent < 0 && errno == EINTR) continue;
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      pollfd descriptor{fd_, POLLOUT, 0};
+      int rc;
       do {
-        poll_result = poll(&descriptor, 1, 1000);
-      } while (poll_result < 0 && errno == EINTR);
-      if (poll_result > 0 && (descriptor.revents & POLLOUT) != 0) {
+        rc = poll(&descriptor, 1, RemainingMs(deadline));
+      } while (rc < 0 && errno == EINTR && RemainingMs(deadline) > 0);
+      if (rc > 0 && (descriptor.revents & POLLOUT) &&
+          !(descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)))
         continue;
-      }
     }
-
-    LOG_ERROR("Failed to send data to {}:{}: {}", peer_addr_, peer_port_,
-              std::strerror(errno));
-    write_buffer_.erase(write_buffer_.begin(),
-                        write_buffer_.begin() + static_cast<ptrdiff_t>(offset));
-    HandleError();
+    Close();
     return false;
   }
-
-  write_buffer_.clear();
   return true;
+}
+
+Connection::FlushResult Connection::FlushWrites(size_t budget) {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+  if (!IsValid()) return FlushResult::kError;
+  while (!write_frames_.empty() && budget > 0) {
+    const auto& frame = write_frames_.front();
+    const size_t length = std::min(budget, frame.size() - write_offset_);
+    const ssize_t sent =
+        send(fd_, frame.data() + write_offset_, length, kSendFlags);
+    if (sent > 0) {
+      write_offset_ += static_cast<size_t>(sent);
+      budget -= static_cast<size_t>(sent);
+      if (write_offset_ == frame.size()) {
+        write_bytes_ -= frame.size();
+        write_frames_.pop_front();
+        write_offset_ = 0;
+      }
+      continue;
+    }
+    if (sent < 0 && errno == EINTR) continue;
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+      return FlushResult::kPending;
+    return FlushResult::kError;
+  }
+  return write_frames_.empty() ? FlushResult::kDrained : FlushResult::kPending;
+}
+
+void Connection::BeginRequest() {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+  ++in_flight_;
+}
+void Connection::FinishRequest() {
+  {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    --in_flight_;
+  }
+  NotifyEvent();
+}
+bool Connection::HasReadEof() const {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+  return read_eof_;
+}
+bool Connection::ShouldClose() const {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+  return close_requested_ ||
+         (read_eof_ && (!read_buffer_.empty() ||
+                        (in_flight_ == 0 && write_frames_.empty())));
+}
+size_t Connection::PendingWriteBytes() const {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+  return write_bytes_ - write_offset_;
+}
+bool Connection::IsIdle() const {
+  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+  return in_flight_ == 0 && write_frames_.empty();
 }
 
 bool Connection::ProcessMessage() {
@@ -291,27 +395,40 @@ void Connection::HandleMessage(const RpcRequest& request) {
 void Connection::HandleError() { Close(); }
 
 void Connection::Close() {
-  // 幂等关闭模块：状态机防止重复关闭，并在释放套接字后通知管理者。
-  std::lock_guard<std::recursive_mutex> lock(io_mutex_);
-  if (state_ == State::DISCONNECTED || state_ == State::DISCONNECTING) {
+  bool managed;
+  {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    if (state_ == State::DISCONNECTED) return;
+    managed = event_managed_;
+    if (managed) close_requested_ = true;
+  }
+  if (managed) {
+    NotifyEvent();
     return;
   }
+  CloseFromEventLoop();
+}
 
-  state_ = State::DISCONNECTING;
-  const int fd = fd_;
-  // 先切换状态再关闭 fd，使并发/递归调用观察到正在关闭状态。
-  if (fd >= 0) {
-    shutdown(fd, SHUT_RDWR);
-    close(fd);
-  }
-  state_ = State::DISCONNECTED;
-
-  if (close_callback_ != nullptr) {
-    const std::shared_ptr<Connection> self = weak_from_this().lock();
-    if (self != nullptr) {
-      close_callback_(self);
+void Connection::CloseFromEventLoop() {
+  CloseCallback callback;
+  {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    if (state_ == State::DISCONNECTED) return;
+    state_ = State::DISCONNECTING;
+    const int fd = std::exchange(fd_, -1);
+    if (fd >= 0) {
+      shutdown(fd, SHUT_RDWR);
+      close(fd);
     }
+    write_frames_.clear();
+    write_bytes_ = write_offset_ = 0;
+    state_ = State::DISCONNECTED;
+    event_callback_ = nullptr;
+    callback = std::move(close_callback_);
   }
-  fd_ = -1;
+  if (callback) {
+    const auto self = weak_from_this().lock();
+    if (self) callback(self);
+  }
 }
 }  // namespace cookrpc

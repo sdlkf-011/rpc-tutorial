@@ -27,7 +27,7 @@ namespace cookrpc {
 namespace {
 
 // 协议帧与端口校验辅助函数：负责解析网络字节序字段并验证端口范围。
-constexpr size_t kHeaderSize = 3 * sizeof(uint32_t);
+constexpr size_t kHeaderSize = RpcHeader::kHeaderSize;
 
 uint32_t ReadNetworkUint32(const char* data) {
   const auto* bytes = reinterpret_cast<const unsigned char*>(data);
@@ -42,7 +42,8 @@ bool IsValidPort(int port) { return port > 0 && port <= 65535; }
 }  // namespace
 
 // 生命周期模块：构造时加载配置，析构时释放连接资源。
-RpcClient::RpcClient(const std::string& config_path) {
+RpcClient::RpcClient(const std::string& config_path)
+    : discovery_(std::make_unique<ZkConnHandler>()) {
   if (!LoadConfig(config_path)) {
     CLIENT_ERROR("Failed to initialize RPC client from {}", config_path);
   }
@@ -65,7 +66,7 @@ bool RpcClient::LoadConfig(const std::string& config_path) {
     const nlohmann::json config = nlohmann::json::parse(config_file);
     const std::string zk_host = config.value("zk_host", "localhost");
     const int zk_port = config.value("zk_port", 2181);
-    const std::string zk_namespace = config.value("zk_namespace", "/cookrpc");
+    std::string zk_namespace = config.value("zk_namespace", "/cookrpc");
     const int timeout_ms = config.value("timeout_ms", 3000);
     const int retry_times = config.value("retry_times", 3);
     const int server_port = config.value("server_port", 8989);
@@ -81,20 +82,21 @@ bool RpcClient::LoadConfig(const std::string& config_path) {
       return false;
     }
 
-    if (!LoadBalancer::InitBalancer(load_balance_strategy)) {
-      CLIENT_WARN("Using fallback load balancing strategy");
-    }
     // 先初始化服务发现，成功后再提交客户端配置，避免留下半初始化状态。
-    if (!ZkConnHandler::GetInstance().InitZkConnHandler(config)) {
+    if (!discovery_->InitZkConnHandler(config)) {
       CLIENT_ERROR("Failed to initialize ZooKeeper service discovery");
       return false;
+    }
+
+    if (!LoadBalancer::InitBalancer(load_balance_strategy)) {
+      CLIENT_WARN("Using fallback load balancing strategy");
     }
 
     DisconnectUnlocked();
     timeout_ms_ = timeout_ms;
     retry_times_ = retry_times;
     default_server_port_ = server_port;
-    zk_namespace_ = zk_namespace;
+    zk_namespace_ = std::move(zk_namespace);
     is_configured_ = true;
     CLIENT_INFO("RPC client configured for ZooKeeper {}:{} namespace {}",
                 zk_host, zk_port, zk_namespace_);
@@ -201,7 +203,7 @@ std::string RpcClient::GetServerAddress() const {
   if (zk_namespace_.empty()) {
     return {};
   }
-  return ZkConnHandler::GetInstance().GetServer(zk_namespace_);
+  return discovery_->GetServer(zk_namespace_);
 }
 
 // 服务发现与地址解析模块：从注册中心获取地址，并兼容“IPv4:端口”和仅 IPv4
@@ -358,7 +360,8 @@ uint32_t RpcClient::GenerateSequenceId() {
 
 // 请求发送模块：生成的完整请求帧交给 Connection，后者负责短写和 SIGPIPE 处理。
 bool RpcClient::SendRequest(const std::string& request_frame) {
-  if (connection_ == nullptr || !connection_->Write(request_frame)) {
+  if (connection_ == nullptr ||
+      !connection_->WriteWithTimeout(request_frame, timeout_ms_)) {
     CLIENT_ERROR("Failed to send RPC request");
     if (connection_ == nullptr || !connection_->IsValid()) {
       DisconnectUnlocked();
@@ -373,6 +376,8 @@ bool RpcClient::ReadResponseFrame(std::string& response_frame) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms_);
 
+  bool terminal = false;
+  bool read_timeout = false;
   while (true) {
     if (pending_response_data_.size() >= kHeaderSize) {
       // 只有收到完整协议头后才能读取 body 长度，避免越界访问。
@@ -392,10 +397,20 @@ bool RpcClient::ReadResponseFrame(std::string& response_frame) {
         // 提取一帧并保留后续字节，支持一次 read 收到多帧的情况。
         response_frame.assign(pending_response_data_.data(), frame_size);
         pending_response_data_.erase(0, frame_size);
+        if (terminal || (connection_ && connection_->HasReadEof()))
+          DisconnectUnlocked();
         return true;
       }
     }
 
+    if (terminal) {
+      CLIENT_ERROR(
+          read_timeout
+              ? "Timed out waiting for an RPC response"
+              : "RPC connection closed before a complete response arrived");
+      DisconnectUnlocked();
+      return false;
+    }
     if (connection_ == nullptr || !connection_->IsValid()) {
       CLIENT_ERROR("RPC connection closed while waiting for a response");
       DisconnectUnlocked();
@@ -418,21 +433,12 @@ bool RpcClient::ReadResponseFrame(std::string& response_frame) {
     const int remaining_ms = static_cast<int>(
         std::min<int64_t>(remaining.count(), std::numeric_limits<int>::max()));
     // 每次读取只等待剩余期限，确保多次分段读取不会突破总超时时间。
-    if (!connection_->ReadWithTimeout(remaining_ms)) {
-      if (!connection_->IsValid()) {
-        DisconnectUnlocked();
-      } else {
-        CLIENT_ERROR("Timed out waiting for an RPC response");
-        DisconnectUnlocked();
-      }
-      return false;
-    }
-
+    const auto result = connection_->ReadWithTimeout(remaining_ms);
     std::string received_data = connection_->GetReadBufferData();
-    if (received_data.empty()) {
-      continue;
-    }
     pending_response_data_.append(received_data);
+    // 下一轮先解析新增数据，再处理 EOF/错误/超时。
+    terminal = result.eof || result.error || result.timeout;
+    read_timeout = result.timeout;
     // 限制累积缓冲区大小，防止异常对端导致无界内存增长。
     if (pending_response_data_.size() >
         Connection::MAX_MESSAGE_SIZE + kHeaderSize) {
