@@ -3,7 +3,6 @@
 
 #include <atomic>
 #include <cstddef>
-#include <map>
 #include <string>
 #include <vector>
 
@@ -21,39 +20,15 @@ class WeightRoundRobinLoadBalancer : public LoadBalancer {
       return "";
     }
 
-    // 设置所有权重为 1
-    std::vector<int> weights(instances.size(), 1);
-
-    // 计算总权重
-    int total_weight = 0;
-    for (int weight : weights) {
-      total_weight += weight;
-    }
-
-    // 递增计算器并取模
-    current_index_ = (current_index_ + 1) % total_weight;
-
-    // 根据累积权重找到对应实例
-    int current_weight = 0;
-    for (size_t i = 0; i < instances.size(); ++i) {
-      current_weight += weights[i];
-      if (current_index_ < current_weight) {
-        return instances[i];
-      }
-    }
-
-    // 降级: 返回第一个实例
-    return instances[0];
+    // 当前所有权重均为 1；用单次原子递增保证并发调用不会丢失轮次
+    const size_t index =
+        (current_index_.fetch_add(1, std::memory_order_relaxed) + 1) %
+        instances.size();
+    return instances[index];
   }
 
  private:
-  std::atomic<int> current_index_;      // 当前索引
-  std::map<std::string, int> weights_;  // 实例权重映射
-
-  // 设置实例权重
-  void SetWeight(const std::string& instance, int weight) {
-    weights_[instance] = weight;
-  }
+  std::atomic<size_t> current_index_;  // 当前索引
 };
 }  // namespace cookrpc
 

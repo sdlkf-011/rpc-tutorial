@@ -35,7 +35,7 @@ class LoadBalancer {
 
  private:
   static std::shared_ptr<LoadBalancer> instance_;  // 单例实例
-  static std::mutex mutex_;                        // 保护单例创建
+  static std::mutex mutex_;  // 保护单例的所有读写
 
   LoadBalancer(const LoadBalancer&) = delete;
   LoadBalancer& operator=(const LoadBalancer&) = delete;

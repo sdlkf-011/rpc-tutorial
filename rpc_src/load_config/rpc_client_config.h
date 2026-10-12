@@ -16,7 +16,7 @@ class RpcClientConfig {
   // 初始化
   bool InitRpcClientConfig(const std::string& config_filename);
 
-  // Setter 方法
+  // Setter 方法：非法值抛出 invalid_argument，并保留旧值。
   void SetZkHost(const std::string& zk_host);
   void SetZkNamespace(const std::string& zk_namespace);
   void SetZkPort(int zk_port);
@@ -43,12 +43,12 @@ class RpcClientConfig {
   RpcClientConfig& operator=(RpcClientConfig&&) = delete;
 
  private:
-  std::string zk_host_;
-  std::string zk_namespace_;
-  int zk_port_;
+  std::string zk_host_ = "localhost";
+  std::string zk_namespace_ = "/cookrpc";
+  int zk_port_ = 2181;
   int timeout_ms_ = 3000;  // 默认超时 3 秒
-  int retry_times_ = 3;    // 默认重试 3 秒
-  int server_port_ = 0;
+  int retry_times_ = 3;    // 默认重试 3 次
+  int server_port_ = 8989;
 
   RpcClientConfig() = default;
 };

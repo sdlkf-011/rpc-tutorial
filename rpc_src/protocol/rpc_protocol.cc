@@ -3,10 +3,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <limits>
 #include <string>
 #include <utility>
 
+#include "error_code.h"
 #include "log_manager.h"
 
 namespace cookrpc {
@@ -14,7 +14,7 @@ namespace {
 
 constexpr std::size_t kUint32Size = sizeof(std::uint32_t);
 // 头部固定为 magic number、body length、sequence id 三个 uint32_t。
-constexpr std::size_t kHeaderSize = 3 * kUint32Size;
+constexpr std::size_t kHeaderSize = RpcHeader::kHeaderSize;
 // 请求包含三个字符串长度，响应包含 error code 和两个字符串长度。
 constexpr std::size_t kRequestFixedBodySize = 3 * kUint32Size;
 constexpr std::size_t kResponseFixedBodySize = 3 * kUint32Size;
@@ -69,8 +69,7 @@ bool ReadField(const std::string& input, std::size_t& offset,
 // message_length 只有 32 位。使用减法形式检查可同时避免 size_t 加法溢出。
 bool CalculateBodySize(std::size_t fixed_size, const std::string& first,
                        const std::string& second, std::size_t& body_size) {
-  constexpr std::size_t kMaximumBodySize =
-      std::numeric_limits<std::uint32_t>::max();
+  constexpr std::size_t kMaximumBodySize = RpcHeader::kMaxBodySize;
 
   body_size = fixed_size;
   for (const std::string* field : {&first, &second}) {
@@ -90,8 +89,7 @@ bool CalculateBodySize(std::size_t fixed_size, const std::string& first,
     return false;
   }
 
-  constexpr std::size_t kMaximumBodySize =
-      std::numeric_limits<std::uint32_t>::max();
+  constexpr std::size_t kMaximumBodySize = RpcHeader::kMaxBodySize;
   if (third.size() > kMaximumBodySize - body_size) {
     return false;
   }
@@ -119,6 +117,7 @@ bool ReadHeader(const std::string& input, std::size_t& offset,
 
   // Deserialize 处理且仅处理一帧，长度必须精确匹配，尾随数据同样视为错误。
   return magic_number == RpcHeader::MAGIC &&
+         body_size <= RpcHeader::kMaxBodySize &&
          static_cast<std::size_t>(body_size) == input.size() - offset;
 }
 
@@ -220,6 +219,17 @@ bool RpcResponse::Serialize(std::string& out) const {
 
   out.clear();
   return false;
+}
+
+bool RpcResponse::SerializeForSend(std::string& out) const {
+  if (Serialize(out)) {
+    return true;
+  }
+  RpcResponse error;
+  error.SetSequenceId(sequence_id_);
+  error.SetErrorCode(static_cast<uint32_t>(ErrorCode::kProtocolError));
+  error.SetErrorMessage("RPC response exceeds the 1 MiB body limit");
+  return error.Serialize(out);
 }
 
 // 响应解析成功后一次性提交所有字段，失败时保持原响应对象不变。

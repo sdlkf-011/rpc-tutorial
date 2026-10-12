@@ -37,12 +37,18 @@ void ConnectionManager::AddConnection(std::shared_ptr<Connection> conn) {
 }
 
 void ConnectionManager::RemoveConnection(int fd) {
+  RemoveConnection(fd, nullptr);
+}
+
+void ConnectionManager::RemoveConnection(
+    int fd, const std::shared_ptr<Connection>& expected) {
   // 删除模块：先从映射摘除连接，再在锁外执行关闭操作。
   std::shared_ptr<Connection> connection;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto iterator = connections_.find(fd);
-    if (iterator == connections_.end()) {
+    if (iterator == connections_.end() ||
+        (expected && iterator->second != expected)) {
       return;
     }
     connection = std::move(iterator->second);
@@ -64,6 +70,13 @@ std::shared_ptr<Connection> ConnectionManager::GetConnection(int fd) {
 size_t ConnectionManager::GetConnectionCount() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return connections_.size();
+}
+std::vector<std::shared_ptr<Connection>> ConnectionManager::GetConnections()
+    const {
+  std::vector<std::shared_ptr<Connection>> result;
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (const auto& entry : connections_) result.push_back(entry.second);
+  return result;
 }
 
 void ConnectionManager::CloseAll() {

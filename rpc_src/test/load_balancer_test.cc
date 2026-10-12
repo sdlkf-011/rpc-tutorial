@@ -3,8 +3,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "random.h"
@@ -135,6 +138,91 @@ TEST(LoadBalancerTest, GetInstanceReturnsTheSameSharedInstance) {
   const std::shared_ptr<LoadBalancer> second = LoadBalancer::GetInstance();
 
   EXPECT_EQ(first, second);
+}
+
+TEST(LoadBalancerTest, StrategySnapshotSurvivesReplacement) {
+  ASSERT_TRUE(LoadBalancer::InitBalancer("round"));
+  const auto snapshot = LoadBalancer::GetInstance();
+  ASSERT_TRUE(LoadBalancer::InitBalancer("random"));
+  EXPECT_EQ(snapshot->Select(kInstances), kInstances[0]);
+  EXPECT_EQ(snapshot->Select(kInstances), kInstances[1]);
+}
+
+TEST(LoadBalancerTest, ConcurrentReplacementAndSelection) {
+  std::atomic<bool> start{false};
+  std::atomic<int> invalid{0};
+  std::vector<std::thread> workers;
+  for (int worker = 0; worker < 6; ++worker) {
+    workers.emplace_back([&] {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      for (int i = 0; i < 4000; ++i) {
+        const auto snapshot = LoadBalancer::GetInstance();
+        for (const auto& selected : {snapshot->Select(kInstances),
+                                     LoadBalancer::SelectServer(kInstances)}) {
+          if (std::find(kInstances.begin(), kInstances.end(), selected) ==
+              kInstances.end()) {
+            ++invalid;
+          }
+        }
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  const std::array<std::string, 3> strategies = {"random", "round", "weight"};
+  for (int i = 0; i < 500; ++i) {
+    EXPECT_TRUE(LoadBalancer::InitBalancer(strategies[i % strategies.size()]));
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  EXPECT_EQ(invalid.load(), 0);
+}
+
+TEST(RandomLoadBalancerTest, ConcurrentSelectionsOnTheSameStrategy) {
+  RandomLoadBalancer balancer;
+  std::atomic<int> invalid{0};
+  std::vector<std::thread> workers;
+  for (int worker = 0; worker < 8; ++worker) {
+    workers.emplace_back([&] {
+      for (int i = 0; i < 4000; ++i) {
+        const auto selected = balancer.Select(kInstances);
+        if (std::find(kInstances.begin(), kInstances.end(), selected) ==
+            kInstances.end()) {
+          ++invalid;
+        }
+      }
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  EXPECT_EQ(invalid.load(), 0);
+}
+
+TEST(WeightRoundRobinLoadBalancerTest, ConcurrentSelectionsDoNotLoseTurns) {
+  WeightRoundRobinLoadBalancer balancer;
+  std::array<std::atomic<int>, 3> counts{};
+  std::vector<std::thread> workers;
+  for (int worker = 0; worker < 6; ++worker) {
+    workers.emplace_back([&] {
+      for (int i = 0; i < 3000; ++i) {
+        const auto selected = balancer.Select(kInstances);
+        const auto found =
+            std::find(kInstances.begin(), kInstances.end(), selected);
+        if (found != kInstances.end()) {
+          ++counts[std::distance(kInstances.begin(), found)];
+        }
+      }
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  for (const auto& count : counts) {
+    EXPECT_EQ(count.load(), 6000);
+  }
 }
 
 }  // namespace

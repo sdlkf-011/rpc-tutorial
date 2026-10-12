@@ -12,7 +12,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-# 优先使用包管理器提供的配置文件，同时兼容系统安装的 CMake 查找模块。
+# 优先使用包管理器提供的配置文件，同时兼容系统安装的 CMake 查找模块
 find_package(Protobuf CONFIG QUIET)
 if(NOT TARGET protobuf::libprotobuf)
   find_package(Protobuf MODULE REQUIRED)
@@ -291,6 +291,63 @@ if(BUILD_TESTING)
 
   include(GoogleTest)
   gtest_discover_tests(load_balancer_test)
+  gtest_discover_tests(rpc_protocol_test)
+  gtest_discover_tests(serializer_test)
+
+  add_executable(rpc_client_config_test rpc_src/test/rpc_client_config_test.cc)
+  target_link_libraries(rpc_client_config_test PRIVATE rpc_common GTest::gtest_main)
+  enable_project_warnings(rpc_client_config_test)
+  gtest_discover_tests(rpc_client_config_test)
+
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME scripts_regression
+    COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/rpc_src/test/scripts_test.py")
+  option(RPC_ENABLE_LIVE_TESTS "Run TCP/ZooKeeper expiration and restart integration tests" OFF)
+  if(RPC_ENABLE_LIVE_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(live_integration_test rpc_src/test/live_integration_test.cc)
+    target_link_libraries(live_integration_test PRIVATE rpc_common)
+    enable_project_warnings(live_integration_test)
+    add_test(NAME live_tcp_zookeeper
+      COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/rpc_src/test/live_test.py"
+        --driver "$<TARGET_FILE:live_integration_test>")
+    set_tests_properties(live_tcp_zookeeper PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  endif()
+
+  # Linux 链接器替换 ZooKeeper C API，确定性验证真实代码的会话交错，
+  # 无需运行外部集群。其他平台仍构建常规测试
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(network_test rpc_src/test/network_test.cc)
+    target_link_libraries(network_test PRIVATE rpc_common GTest::gtest_main)
+    target_link_options(network_test PRIVATE
+      "-Wl,--wrap=zookeeper_init" "-Wl,--wrap=zookeeper_close"
+      "-Wl,--wrap=zoo_get_children" "-Wl,--wrap=zoo_get"
+      "-Wl,--wrap=deallocate_String_vector")
+    enable_project_warnings(network_test)
+    gtest_discover_tests(network_test PROPERTIES TIMEOUT 30)
+
+    add_executable(service_registry_test rpc_src/test/service_registry_test.cc)
+    target_link_libraries(service_registry_test PRIVATE rpc_common GTest::gtest_main)
+    target_link_options(service_registry_test PRIVATE
+      "-Wl,--wrap=zookeeper_init" "-Wl,--wrap=zookeeper_close"
+      "-Wl,--wrap=zoo_exists" "-Wl,--wrap=zoo_wexists"
+      "-Wl,--wrap=zoo_get" "-Wl,--wrap=zoo_create" "-Wl,--wrap=zoo_client_id")
+    enable_project_warnings(service_registry_test)
+    gtest_discover_tests(service_registry_test PROPERTIES TIMEOUT 30)
+
+    add_executable(zk_conn_handler_test rpc_src/test/zk_conn_handler_test.cc)
+    target_link_libraries(zk_conn_handler_test PRIVATE rpc_common GTest::gtest_main)
+    target_link_options(zk_conn_handler_test PRIVATE
+      "-Wl,--wrap=zookeeper_init"
+      "-Wl,--wrap=zookeeper_close"
+      "-Wl,--wrap=zoo_get_children"
+      "-Wl,--wrap=zoo_get"
+      "-Wl,--wrap=deallocate_String_vector"
+      "-Wl,--wrap=zoo_exists"
+      "-Wl,--wrap=zoo_create"
+    )
+    enable_project_warnings(zk_conn_handler_test)
+    gtest_discover_tests(zk_conn_handler_test PROPERTIES TIMEOUT 30)
+  endif()
 
   add_executable(zstd_compress_test
     rpc_src/test/zstd_compress_test.cc
@@ -307,5 +364,5 @@ if(BUILD_TESTING)
   gtest_discover_tests(zstd_compress_test)
   gtest_discover_tests(aes_encrypt_test)
   gtest_discover_tests(service_test)
-  gtest_discover_tests(thread_pool_test)
+  gtest_discover_tests(thread_pool_test PROPERTIES TIMEOUT 30)
 endif()

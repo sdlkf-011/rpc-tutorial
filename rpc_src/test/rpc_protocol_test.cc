@@ -152,5 +152,51 @@ TEST(RpcResponseTest, RejectsMalformedFramesWithoutChangingDestination) {
   EXPECT_EQ(destination.GetResultData(), "existing result");
 }
 
+TEST(RpcRequestTest,
+     BodyBoundaryAcceptedAndOverflowRejectedBeforeSerialization) {
+  RpcRequest request;
+  request.SetServiceName("s");
+  request.SetMethodName("m");
+  request.SetPayload(std::string(RpcHeader::kMaxBodySize - 14, 'x'));
+  std::string frame;
+  ASSERT_TRUE(request.Serialize(frame));
+  EXPECT_EQ(frame.size(), RpcHeader::kMaxFrameSize);
+  RpcRequest decoded;
+  EXPECT_TRUE(decoded.Deserialize(frame));
+  request.SetPayload(std::string(RpcHeader::kMaxBodySize - 13, 'x'));
+  EXPECT_FALSE(request.Serialize(frame));
+  EXPECT_TRUE(frame.empty());
+}
+TEST(RpcResponseTest,
+     OversizedResultOrErrorBecomesShortErrorWithOriginalSequence) {
+  for (bool huge_error : {false, true}) {
+    RpcResponse response;
+    response.SetSequenceId(99);
+    if (huge_error)
+      response.SetErrorMessage(std::string(RpcHeader::kMaxBodySize, 'x'));
+    else
+      response.SetResultData(std::string(RpcHeader::kMaxBodySize, 'x'));
+    std::string frame;
+    EXPECT_FALSE(response.Serialize(frame));
+    ASSERT_TRUE(response.SerializeForSend(frame));
+    RpcResponse decoded;
+    ASSERT_TRUE(decoded.Deserialize(frame));
+    EXPECT_EQ(decoded.GetSequenceId(), 99u);
+    EXPECT_NE(decoded.GetErrorCode(), 0u);
+    EXPECT_TRUE(decoded.GetResultData().empty());
+    EXPECT_LT(frame.size(), 256u);
+  }
+}
+TEST(RpcResponseTest, ReceivingFrameAboveBodyLimitIsRejected) {
+  RpcResponse response;
+  response.SetResultData(std::string(RpcHeader::kMaxBodySize - 12, 'x'));
+  std::string frame;
+  ASSERT_TRUE(response.Serialize(frame));
+  RpcResponse decoded;
+  EXPECT_TRUE(decoded.Deserialize(frame));
+  frame.push_back('x');
+  WriteUint32(frame, 4, RpcHeader::kMaxBodySize + 1);
+  EXPECT_FALSE(decoded.Deserialize(frame));
+}
 }  // namespace
 }  // namespace cookrpc

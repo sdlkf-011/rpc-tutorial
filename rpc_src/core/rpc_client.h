@@ -10,13 +10,15 @@
 #include <stdexcept>
 #include <string>
 
+#include "connection.h"
 #include "error_code.h"
 #include "log_manager.h"
-#include "connection.h"
 #include "rpc_protocol.h"
 #include "serializer_manager.h"
 
 namespace cookrpc {
+
+class ZkConnHandler;
 
 // RPC 客户端在单条 TCP 连接上串行执行调用。
 // 无需额外响应分发线程即可准确匹配请求与响应。
@@ -79,16 +81,14 @@ class RpcClient {
                                   const std::string& method_name,
                                   const Request& request,
                                   SerializeType serialize_type) {
-    return std::async(
-        std::launch::async,
-        [this, service_name, method_name, request, serialize_type] {
-          Response response{};
-          if (!Call(service_name, method_name, request, serialize_type,
-                    response)) {
-            throw std::runtime_error("RPC call failed");
-          }
-          return response;
-        });
+    return std::async(std::launch::async, [this, service_name, method_name,
+                                           request, serialize_type] {
+      Response response{};
+      if (!Call(service_name, method_name, request, serialize_type, response)) {
+        throw std::runtime_error("RPC call failed");
+      }
+      return response;
+    });
   }
 
   // 返回客户端当前是否持有可用连接。
@@ -136,7 +136,7 @@ class RpcClient {
       return false;
     }
 
-    constexpr size_t kHeaderSize = 3 * sizeof(uint32_t);
+    constexpr size_t kHeaderSize = RpcHeader::kHeaderSize;
     if (request_frame.size() > Connection::MAX_MESSAGE_SIZE + kHeaderSize) {
       CLIENT_ERROR("RPC request frame exceeds the maximum size");
       request_frame.clear();
@@ -174,8 +174,7 @@ class RpcClient {
     if (rpc_response.GetErrorCode() !=
         static_cast<uint32_t>(ErrorCode::kSuccess)) {
       CLIENT_ERROR("RPC server returned error {}: {}",
-                   rpc_response.GetErrorCode(),
-                   rpc_response.GetErrorMessage());
+                   rpc_response.GetErrorCode(), rpc_response.GetErrorMessage());
       return false;
     }
     if (!SerializerManager::Deserialize(
@@ -192,6 +191,7 @@ class RpcClient {
   int default_server_port_ = 8989;
   std::string zk_namespace_;
   bool is_configured_ = false;
+  std::unique_ptr<ZkConnHandler> discovery_;
 
   // TCP 连接及待读取响应缓存。
   int socket_fd_ = -1;

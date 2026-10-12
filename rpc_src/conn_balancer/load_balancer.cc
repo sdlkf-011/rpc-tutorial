@@ -50,12 +50,10 @@ struct BalancerFactory {
 }  // namespace
 
 std::shared_ptr<LoadBalancer> LoadBalancer::GetInstance() {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!instance_) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!instance_) {
-      // 默认使用随机负载均衡器
-      instance_ = BalancerFactory::CreateRandom();
-    }
+    // 默认使用随机负载均衡器
+    instance_ = BalancerFactory::CreateRandom();
   }
   return instance_;
 }
@@ -90,15 +88,6 @@ bool LoadBalancer::InitBalancer(const std::string& type) {
 
 std::string LoadBalancer::SelectServer(
     const std::vector<std::string>& servers) {
-  // 确保初始化
-  if (!instance_) {
-    LOG_WARN("Load balancer not initialized, using default random balancer");
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!instance_) {
-      instance_ = std::make_shared<RandomLoadBalancer>();
-    }
-  }
-
   // 空列表检查
   if (servers.empty()) {
     LOG_ERROR("No instances available for load balancing");
@@ -107,7 +96,9 @@ std::string LoadBalancer::SelectServer(
 
   // 调用具体策略的 Select 方法
   try {
-    return instance_->Select(servers);
+    // 锁内取得有所有权的快照，策略调用期间允许切换全局策略。
+    const auto balancer = GetInstance();
+    return balancer->Select(servers);
   } catch (std::exception& e) {
     LOG_ERROR("Error in load balancer select: {}", e.what());
     return servers[0];

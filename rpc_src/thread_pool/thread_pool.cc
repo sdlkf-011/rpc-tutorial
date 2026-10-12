@@ -1,271 +1,367 @@
 #include "thread_pool.h"
 
-#include <chrono>
-#include <cstddef>
+#include <algorithm>
+#include <condition_variable>
 #include <exception>
 #include <mutex>
-#include <sstream>
-#include <string>
+#include <queue>
 #include <thread>
+#include <vector>
 
 #include "log_manager.h"
 
 namespace meeting_ctrl {
 namespace {
+using Clock = std::chrono::steady_clock;
 
-size_t NormalizeThreadCount(size_t count) { return count == 0 ? 1 : count; }
-
-void JoinWorkers(std::vector<std::thread>* workers) {
-  for (std::thread& worker : *workers) {
-    if (worker.joinable()) {
-      worker.join();
-    }
+// 先比较可表示的剩余时间，避免将巨大毫秒值转换成纳秒或相加时溢出。
+Clock::time_point Deadline(std::chrono::milliseconds timeout) {
+  const auto now = Clock::now();
+  if (timeout <= std::chrono::milliseconds::zero()) {
+    return now;
   }
+  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      Clock::time_point::max() - now);
+  return timeout >= remaining ? Clock::time_point::max() : now + timeout;
+}
+
+template <typename Predicate>
+bool Wait(std::condition_variable& cv, std::unique_lock<std::mutex>& lock,
+          std::chrono::milliseconds timeout, Predicate predicate) {
+  if (timeout == std::chrono::milliseconds::max()) {
+    cv.wait(lock, predicate);
+    return true;
+  }
+  return cv.wait_until(lock, Deadline(timeout), predicate);
+}
+
+ThreadPoolStruct FixedConfig(size_t threads) {
+  ThreadPoolStruct config;
+  config.core_threads = std::max(size_t{1}, threads);
+  config.max_threads = config.core_threads;
+  config.max_queue_size = config.core_threads;
+  return config;
 }
 }  // namespace
 
-ThreadPool::ThreadPool(size_t threads)
-    : current_threads_(0),
-      stop_(false),
-      state_(ThreadPoolState::kRunning),
-      tasks_completed_(0),
-      tasks_failed_(0),
-      active_threads_(0),
-      total_task_time_(0.0) {
-  const size_t thread_count = NormalizeThreadCount(threads);
-  config_.core_threads = thread_count;
-  config_.max_threads = thread_count;
-  config_.max_queue_size = thread_count;
+struct ThreadPool::Worker {
+  std::thread thread;
+  bool exited = false;  // 在 queue_mutex 下读写，所有权转移后由回收者持有。
+};
 
-  workers_.reserve(config_.max_threads);
-  thread_last_active_.resize(config_.max_threads);
+struct ThreadPool::State {
+  explicit State(ThreadPoolStruct settings) : config(settings) {
+    config.core_threads = std::max(size_t{1}, config.core_threads);
+    config.max_threads = std::max(config.core_threads, config.max_threads);
+    config.keep_alive_time =
+        std::max(std::chrono::milliseconds{1}, config.keep_alive_time);
+    workers.reserve(config.max_threads);
+  }
 
-  for (size_t i = 0; i < thread_count; ++i) {
-    current_threads_.fetch_add(1);
-    workers_.emplace_back(&ThreadPool::WorkerThread, this);
-    thread_last_active_[i] = std::chrono::steady_clock::now();
+  ThreadPoolStruct config;
+  mutable std::mutex queue_mutex;
+  std::condition_variable condition;
+  std::vector<std::unique_ptr<Worker>> workers;
+  size_t reaping_workers = 0;
+  size_t current_threads = 0;
+  size_t active_threads = 0;
+  ThreadPoolState status = ThreadPoolState::kRunning;
+  std::priority_queue<TaskWrapper> tasks;
+
+  mutable std::mutex stats_mutex;
+  size_t tasks_completed = 0;
+  size_t tasks_failed = 0;
+  size_t timed_tasks = 0;
+  double total_task_time = 0;
+};
+
+thread_local const ThreadPool::State* ThreadPool::worker_state_ = nullptr;
+
+ThreadPool::TaskResult::~TaskResult() {
+  std::lock_guard<std::mutex> lock(state->stats_mutex);
+  if (succeeded) {
+    ++state->tasks_completed;
+  } else {
+    ++state->tasks_failed;
   }
 }
+
+ThreadPool::ThreadPool(size_t threads) : ThreadPool(FixedConfig(threads)) {}
 
 ThreadPool::ThreadPool(const ThreadPoolStruct& config)
-    : current_threads_(0),
-      config_(config),
-      stop_(false),
-      state_(ThreadPoolState::kRunning),
-      tasks_completed_(0),
-      tasks_failed_(0),
-      active_threads_(0),
-      total_task_time_(0.0) {
-  config_.core_threads = NormalizeThreadCount(config_.core_threads);
-  config_.max_threads = NormalizeThreadCount(config_.max_threads);
-  if (config_.max_threads < config_.core_threads) {
-    config_.max_threads = config_.core_threads;
-  }
-
-  workers_.reserve(config_.max_threads);
-  thread_last_active_.resize(config_.max_threads);
-
-  for (size_t i = 0; i < config_.core_threads; ++i) {
-    current_threads_.fetch_add(1);
-    workers_.emplace_back(&ThreadPool::WorkerThread, this);
-    thread_last_active_[i] = std::chrono::steady_clock::now();
-  }
-}
-
-void ThreadPool::WorkerThread() {
-  std::ostringstream thread_id_stream;
-  thread_id_stream << std::this_thread::get_id();
-  const std::string thread_id = thread_id_stream.str();
-  while (true) {
-    TaskWrapper task;
-    {
-      std::unique_lock<std::mutex> lock(queue_mutex_);
-      const bool signaled =
-          condition_.wait_for(lock, config_.keep_alive_time, [this] {
-            return stop_ || ((state_ == ThreadPoolState::kRunning ||
-                              state_ == ThreadPoolState::kShuttingDown) &&
-                             !tasks_.empty());
-          });
-
-      // 非核心线程在空闲超时后退出，核心线程始终保留。
-      if (!signaled && current_threads_.load() > config_.core_threads) {
-        current_threads_.fetch_sub(1);
-        LOG_INFO(
-            "[ThreadPool] Worker thread {} exited after idle timeout, "
-            "remaining threads: {}",
-            thread_id, current_threads_.load());
-        return;
-      }
-
-      if ((stop_ || state_ == ThreadPoolState::kStopped) && tasks_.empty()) {
-        return;
-      }
-
-      if (state_ == ThreadPoolState::kPaused || tasks_.empty()) {
-        continue;
-      }
-
-      task = std::move(const_cast<TaskWrapper&>(tasks_.top()));
-      tasks_.pop();
-
-      LOG_DEBUG(
-          "[ThreadPool] Thread {} picked up task, queue size: {}, "
-          "active threads: {}",
-          thread_id, tasks_.size(), active_threads_.load());
-    }
-
-    if (!task.Valid()) {
-      continue;
-    }
-
-    const auto start_time = std::chrono::steady_clock::now();
-    active_threads_.fetch_add(1);
-    bool succeeded = false;
-
-    try {
-      task.Execute();
-      succeeded = true;
-    } catch (const std::exception& error) {
-      LOG_ERROR("[ThreadPool] Thread {} task failed: {}", thread_id,
-                error.what());
-    } catch (...) {
-      LOG_ERROR("[ThreadPool] Thread {} task failed with an unknown exception",
-                thread_id);
-    }
-
-    const auto end_time = std::chrono::steady_clock::now();
-    const double duration_ms =
-        std::chrono::duration<double, std::milli>(end_time - start_time)
-            .count();
-    {
-      std::lock_guard<std::mutex> lock(stats_mutex_);
-      total_task_time_ += duration_ms;
-    }
-
-    if (succeeded) {
-      tasks_completed_.fetch_add(1);
-    } else {
-      tasks_failed_.fetch_add(1);
-    }
-
-    active_threads_.fetch_sub(1);
-
-    LOG_DEBUG("[ThreadPool] Thread {} completed task in {} ms", thread_id,
-              duration_ms);
-
-    condition_.notify_all();
-  }
-}
-
-void ThreadPool::AdjustThreadCount() {
-  // 调用方持有 queue_mutex_，根据积压任务数按需增加一个工作线程。
-  if (current_threads_.load() >= config_.max_threads ||
-      tasks_.size() <= current_threads_.load() || stop_ ||
-      state_ != ThreadPoolState::kRunning) {
-    return;
-  }
-
-  current_threads_.fetch_add(1);
+    : state_(std::make_shared<State>(config)) {
   try {
-    workers_.emplace_back(&ThreadPool::WorkerThread, this);
+    std::lock_guard<std::mutex> lock(state_->queue_mutex);
+    for (size_t i = 0; i < state_->config.core_threads; ++i) {
+      AddWorkerLocked(state_);
+    }
   } catch (...) {
-    current_threads_.fetch_sub(1);
+    // 已创建的线程必须退出并回收后，才能继续传播构造失败。
+    RequestShutdown();
+    WaitForTermination();
     throw;
   }
 }
 
-void ThreadPool::Pause() {
-  std::lock_guard<std::mutex> lock(queue_mutex_);
-  if (state_ == ThreadPoolState::kRunning) {
-    state_ = ThreadPoolState::kPaused;
-    condition_.notify_all();
+void ThreadPool::AddWorkerLocked(const std::shared_ptr<State>& state) {
+  auto worker = std::make_unique<Worker>();
+  Worker* raw = worker.get();
+  state->workers.push_back(std::move(worker));
+  ++state->current_threads;
+  try {
+    raw->thread = std::thread([state, raw] { WorkerThread(state, raw); });
+  } catch (...) {
+    --state->current_threads;
+    state->workers.pop_back();
+    throw;
   }
 }
 
-void ThreadPool::Resume() {
-  std::lock_guard<std::mutex> lock(queue_mutex_);
-  if (state_ == ThreadPoolState::kPaused) {
-    state_ = ThreadPoolState::kRunning;
-    condition_.notify_all();
+void ThreadPool::AdjustThreadCountLocked(const std::shared_ptr<State>& state) {
+  // 将正在回收的句柄计入上限，避免并发提交时退出线程积累无界。
+  if (state->status != ThreadPoolState::kRunning ||
+      state->workers.size() + state->reaping_workers >=
+          state->config.max_threads ||
+      state->tasks.size() <= state->current_threads - state->active_threads) {
+    return;
   }
+  try {
+    AddWorkerLocked(state);
+  } catch (const std::exception& error) {
+    // 已接收的任务仍由现有 worker 执行，不能在入队后将它报告为提交失败。
+    LOG_ERROR("[ThreadPool] Failed to add worker: {}", error.what());
+  }
+}
+
+void ThreadPool::JoinRetired(const std::shared_ptr<State>& state,
+                             std::vector<std::unique_ptr<Worker>> workers) {
+  // 每个句柄只由锁内移出它的调用者负责 join，期间不持有队列锁。
+  for (auto& worker : workers) {
+    worker->thread.join();
+  }
+  const size_t count = workers.size();
+  workers.clear();
+  {
+    std::lock_guard<std::mutex> lock(state->queue_mutex);
+    state->reaping_workers -= count;
+    if (state->status == ThreadPoolState::kShuttingDown &&
+        state->current_threads == 0 && state->workers.empty() &&
+        state->reaping_workers == 0) {
+      state->status = ThreadPoolState::kStopped;
+    }
+  }
+  state->condition.notify_all();
+}
+
+bool ThreadPool::SubmitTask(TaskWrapper task) {
+  const auto state = state_;
+  std::vector<std::unique_ptr<Worker>> retired;
+  bool accepted = false;
+  try {
+    std::lock_guard<std::mutex> lock(state->queue_mutex);
+    // 回收和关闭在同一把锁内转移 worker 所有权。
+    const auto exited =
+        std::count_if(state->workers.begin(), state->workers.end(),
+                      [](const auto& worker) { return worker->exited; });
+    // 分配失败发生在所有权移动之前，不会析构 joinable 的线程。
+    retired.reserve(exited);
+    for (auto it = state->workers.begin(); it != state->workers.end();) {
+      if ((*it)->exited) {
+        retired.push_back(std::move(*it));
+        it = state->workers.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    state->reaping_workers += retired.size();
+    if ((state->status == ThreadPoolState::kRunning ||
+         state->status == ThreadPoolState::kPaused) &&
+        (state->config.max_queue_size == 0 ||
+         state->tasks.size() < state->config.max_queue_size)) {
+      state->tasks.push(std::move(task));
+      accepted = true;
+      AdjustThreadCountLocked(state);
+    }
+  } catch (...) {
+    JoinRetired(state, std::move(retired));
+    throw;
+  }
+  state->condition.notify_all();
+  JoinRetired(state, std::move(retired));
+  if (accepted) {
+    std::lock_guard<std::mutex> lock(state->queue_mutex);
+    AdjustThreadCountLocked(state);
+  }
+  return accepted;
+}
+
+void ThreadPool::WorkerThread(const std::shared_ptr<State>& state,
+                              Worker* worker) {
+  worker_state_ = state.get();
+  for (;;) {
+    TaskWrapper task;
+    {
+      std::unique_lock<std::mutex> lock(state->queue_mutex);
+      const bool signaled =
+          Wait(state->condition, lock, state->config.keep_alive_time, [&] {
+            return state->status == ThreadPoolState::kShuttingDown ||
+                   state->status == ThreadPoolState::kStopped ||
+                   (state->status == ThreadPoolState::kRunning &&
+                    !state->tasks.empty());
+          });
+      const bool closing = state->status == ThreadPoolState::kShuttingDown ||
+                           state->status == ThreadPoolState::kStopped;
+      if ((closing && state->tasks.empty()) ||
+          (!signaled && state->current_threads > state->config.core_threads)) {
+        worker->exited = true;
+        --state->current_threads;
+        lock.unlock();
+        state->condition.notify_all();
+        worker_state_ = nullptr;
+        return;
+      }
+      if (state->status == ThreadPoolState::kPaused || state->tasks.empty()) {
+        continue;
+      }
+      task = std::move(const_cast<TaskWrapper&>(state->tasks.top()));
+      state->tasks.pop();
+      // 出队和执行中计数必须一起提交，关闭观察不到中间空隙。
+      ++state->active_threads;
+    }
+
+    const auto started = Clock::now();
+    try {
+      task.Execute();
+    } catch (const std::exception& error) {
+      LOG_ERROR("[ThreadPool] Task wrapper failed: {}", error.what());
+    } catch (...) {
+      LOG_ERROR("[ThreadPool] Task wrapper failed with unknown exception");
+    }
+    const double elapsed =
+        std::chrono::duration<double, std::milli>(Clock::now() - started)
+            .count();
+    {
+      std::lock_guard<std::mutex> lock(state->stats_mutex);
+      state->total_task_time += elapsed;
+      ++state->timed_tasks;
+    }
+    {
+      std::lock_guard<std::mutex> lock(state->queue_mutex);
+      --state->active_threads;
+    }
+    state->condition.notify_all();
+  }
+}
+
+bool ThreadPool::Pause() {
+  std::lock_guard<std::mutex> lock(state_->queue_mutex);
+  if (state_->status != ThreadPoolState::kRunning) {
+    return false;
+  }
+  state_->status = ThreadPoolState::kPaused;
+  state_->condition.notify_all();
+  return true;
+}
+
+bool ThreadPool::Resume() {
+  std::lock_guard<std::mutex> lock(state_->queue_mutex);
+  if (state_->status != ThreadPoolState::kPaused) {
+    return false;
+  }
+  state_->status = ThreadPoolState::kRunning;
+  state_->condition.notify_all();
+  return true;
 }
 
 ThreadPool::Stats ThreadPool::GetStats() const {
   Stats stats;
-  stats.tasks_completed = tasks_completed_.load();
-  stats.tasks_failed = tasks_failed_.load();
-  stats.active_threads = active_threads_.load();
   {
-    std::lock_guard<std::mutex> lock(stats_mutex_);
-    const size_t total_tasks = stats.tasks_completed + stats.tasks_failed;
+    std::lock_guard<std::mutex> lock(state_->stats_mutex);
+    stats.tasks_completed = state_->tasks_completed;
+    stats.tasks_failed = state_->tasks_failed;
     stats.avg_task_time_ms =
-        total_tasks == 0 ? 0.0 : total_task_time_ / total_tasks;
+        state_->timed_tasks == 0
+            ? 0
+            : state_->total_task_time / state_->timed_tasks;
+  }
+  {
+    std::lock_guard<std::mutex> lock(state_->queue_mutex);
+    stats.active_threads = state_->active_threads;
+    stats.worker_handles = state_->workers.size() + state_->reaping_workers;
   }
   return stats;
 }
 
+size_t ThreadPool::Size() const noexcept {
+  std::lock_guard<std::mutex> lock(state_->queue_mutex);
+  return state_->current_threads;
+}
 size_t ThreadPool::QueueSize() const noexcept {
-  std::lock_guard<std::mutex> lock(queue_mutex_);
-  return tasks_.size();
+  std::lock_guard<std::mutex> lock(state_->queue_mutex);
+  return state_->tasks.size();
+}
+ThreadPoolState ThreadPool::GetState() const noexcept {
+  std::lock_guard<std::mutex> lock(state_->queue_mutex);
+  return state_->status;
+}
+bool ThreadPool::IsWorkerThread() const noexcept {
+  return worker_state_ == state_.get();
 }
 
-bool ThreadPool::ShutDown(std::chrono::milliseconds wait_timeout_ms) {
-  std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
+void ThreadPool::RequestShutdown() {
   {
-    std::unique_lock<std::mutex> lock(queue_mutex_);
-    if (state_ == ThreadPoolState::kStopped) {
-      lifecycle_lock.unlock();
-      JoinWorkers(&workers_);
-      current_threads_.store(0);
-      return true;
-    }
-    state_ = ThreadPoolState::kShuttingDown;
-    condition_.notify_all();
-  }
-
-  std::unique_lock<std::mutex> lock(queue_mutex_);
-  const auto drained = [this] {
-    return tasks_.empty() && active_threads_.load() == 0;
-  };
-
-  bool completed = drained();
-  if (!completed) {
-    completed = condition_.wait_for(lock, wait_timeout_ms, drained);
-  }
-
-  // 超时后丢弃尚未开始的任务，正在执行的任务仍会被等待至结束。
-  stop_ = true;
-  if (!completed) {
-    while (!tasks_.empty()) {
-      tasks_.pop();
+    std::lock_guard<std::mutex> lock(state_->queue_mutex);
+    if (state_->status != ThreadPoolState::kStopped) {
+      state_->status = ThreadPoolState::kShuttingDown;
     }
   }
-
-  state_ = ThreadPoolState::kStopped;
-  condition_.notify_all();
-  lock.unlock();
-
-  JoinWorkers(&workers_);
-  current_threads_.store(0);
-  return completed;
+  state_->condition.notify_all();
 }
 
-void ThreadPool::Stop() {
-  std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
+bool ThreadPool::WaitForTermination(std::chrono::milliseconds timeout) {
+  if (IsWorkerThread()) {
+    return false;
+  }
+  const auto state = state_;
+  std::vector<std::unique_ptr<Worker>> retired;
   {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    stop_ = true;
-    state_ = ThreadPoolState::kStopped;
-    while (!tasks_.empty()) {
-      tasks_.pop();
+    std::unique_lock<std::mutex> lock(state->queue_mutex);
+    const bool finished = Wait(state->condition, lock, timeout, [&] {
+      return state->current_threads == 0 && state->reaping_workers == 0;
+    });
+    if (!finished) {
+      return false;
     }
-    condition_.notify_all();
+    retired.swap(state->workers);
+    state->reaping_workers += retired.size();
   }
-  JoinWorkers(&workers_);
-  current_threads_.store(0);
+  JoinRetired(state, std::move(retired));
+  return true;
 }
 
-ThreadPoolState ThreadPool::GetState() const noexcept { return state_.load(); }
+bool ThreadPool::ShutDown(std::chrono::milliseconds timeout) {
+  RequestShutdown();
+  return WaitForTermination(timeout);
+}
+void ThreadPool::Stop() { ShutDown(); }
 
-ThreadPool::~ThreadPool() { Stop(); }
+ThreadPool::~ThreadPool() {
+  RequestShutdown();
+  if (!IsWorkerThread()) {
+    WaitForTermination();
+    return;
+  }
+  // 最后一个 shared_ptr 也可能由业务任务释放。由独立回收者 join，
+  // worker 持有 State，避免在自身线程中等待或访问已析构的 ThreadPool。
+  const auto state = state_;
+  std::vector<std::unique_ptr<Worker>> retired;
+  {
+    std::lock_guard<std::mutex> lock(state->queue_mutex);
+    retired.swap(state->workers);
+    state->reaping_workers += retired.size();
+  }
+  std::thread([state, retired = std::move(retired)]() mutable {
+    JoinRetired(state, std::move(retired));
+  }).detach();
+}
 }  // namespace meeting_ctrl

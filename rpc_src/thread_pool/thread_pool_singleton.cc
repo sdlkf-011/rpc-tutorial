@@ -1,103 +1,126 @@
 #include "thread_pool_singleton.h"
 
-#include <memory>
-#include <mutex>
-
 namespace meeting_ctrl {
-
-std::unique_ptr<ThreadPool> ThreadPoolSingleton::instance_;
 std::mutex ThreadPoolSingleton::mutex_;
+std::shared_ptr<ThreadPool> ThreadPoolSingleton::instance_;
+bool ThreadPoolSingleton::destroying_ = false;
 
 bool ThreadPoolSingleton::Init(size_t threads) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (instance_ != nullptr) {
+  if (instance_ || destroying_) {
     return false;
   }
-  instance_ = std::make_unique<ThreadPool>(threads);
+  instance_ = std::make_shared<ThreadPool>(threads);
   return true;
 }
 
 bool ThreadPoolSingleton::Init(const ThreadPoolStruct& config) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (instance_ != nullptr) {
+  if (instance_ || destroying_) {
     return false;
   }
-  instance_ = std::make_unique<ThreadPool>(config);
+  instance_ = std::make_shared<ThreadPool>(config);
   return true;
 }
 
-ThreadPool& ThreadPoolSingleton::GetInstance() {
+std::shared_ptr<ThreadPool> ThreadPoolSingleton::GetInstance() {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (instance_ == nullptr) {
-    instance_ = std::make_unique<ThreadPool>();
+  if (destroying_) {
+    return nullptr;
   }
-  return *instance_;
+  if (!instance_) {
+    instance_ = std::make_shared<ThreadPool>();
+  }
+  return instance_;
 }
 
-ThreadPool& ThreadPoolSingleton::GetInstance(const ThreadPoolStruct& config) {
+std::shared_ptr<ThreadPool> ThreadPoolSingleton::GetInstance(
+    const ThreadPoolStruct& config) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (instance_ == nullptr) {
-    instance_ = std::make_unique<ThreadPool>(config);
+  if (destroying_) {
+    return nullptr;
   }
-  return *instance_;
+  if (!instance_) {
+    instance_ = std::make_shared<ThreadPool>(config);
+  }
+  return instance_;
+}
+
+std::shared_ptr<ThreadPool> ThreadPoolSingleton::Snapshot() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // 销毁期间保留旧池供统计接口访问，不触发惰性初始化。
+  return instance_;
 }
 
 ThreadPool::Stats ThreadPoolSingleton::GetStats() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return instance_ == nullptr ? ThreadPool::Stats{} : instance_->GetStats();
+  const auto pool = Snapshot();
+  return pool ? pool->GetStats() : ThreadPool::Stats{};
 }
-
 size_t ThreadPoolSingleton::GetQueueSize() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return instance_ == nullptr ? 0 : instance_->QueueSize();
+  const auto pool = Snapshot();
+  return pool ? pool->QueueSize() : 0;
 }
-
 size_t ThreadPoolSingleton::GetPoolSize() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return instance_ == nullptr ? 0 : instance_->Size();
+  const auto pool = Snapshot();
+  return pool ? pool->Size() : 0;
 }
-
 bool ThreadPoolSingleton::Pause() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (instance_ == nullptr ||
-      instance_->GetState() != ThreadPoolState::kRunning) {
-    return false;
-  }
-  instance_->Pause();
-  return true;
+  const auto pool = Snapshot();
+  return pool && pool->Pause();
 }
-
 bool ThreadPoolSingleton::Resume() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (instance_ == nullptr ||
-      instance_->GetState() != ThreadPoolState::kPaused) {
+  const auto pool = Snapshot();
+  return pool && pool->Resume();
+}
+bool ThreadPoolSingleton::RequestShutdown() {
+  const auto pool = Snapshot();
+  if (!pool) {
     return false;
   }
-  instance_->Resume();
+  pool->RequestShutdown();
+  return true;
+}
+bool ThreadPoolSingleton::WaitForTermination(
+    std::chrono::milliseconds timeout) {
+  const auto pool = Snapshot();
+  return pool && pool->WaitForTermination(timeout);
+}
+bool ThreadPoolSingleton::Shutdown(std::chrono::milliseconds timeout) {
+  const auto pool = Snapshot();
+  return pool && pool->ShutDown(timeout);
+}
+
+bool ThreadPoolSingleton::Destroy() {
+  const auto pool = Snapshot();
+  if (pool && pool->IsWorkerThread()) {
+    // 当前任务不能等待自己，且不能移除全局所有者后留下自析构风险。
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (destroying_ || pool != instance_) {
+      return false;
+    }
+    if (!pool) {
+      return true;
+    }
+    destroying_ = true;
+  }
+
+  // 不持有全局锁，关闭中的任务可照常读取统计信息。
+  pool->RequestShutdown();
+  pool->WaitForTermination();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    instance_.reset();  // 局部快照保证对象在解锁后才可能析构。
+    destroying_ = false;
+  }
   return true;
 }
 
-bool ThreadPoolSingleton::Shutdown(std::chrono::milliseconds timeout) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return instance_ != nullptr && instance_->ShutDown(timeout);
-}
-
-void ThreadPoolSingleton::Destroy() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (instance_ != nullptr) {
-    instance_->Stop();
-    instance_.reset();
-  }
-}
-
-bool ThreadPoolSingleton::Exists() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return instance_ != nullptr;
-}
-
+bool ThreadPoolSingleton::Exists() { return Snapshot() != nullptr; }
 ThreadPoolState ThreadPoolSingleton::GetState() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return instance_ == nullptr ? ThreadPoolState::kStopped
-                              : instance_->GetState();
+  const auto pool = Snapshot();
+  return pool ? pool->GetState() : ThreadPoolState::kStopped;
 }
 }  // namespace meeting_ctrl

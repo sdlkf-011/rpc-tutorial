@@ -3,7 +3,8 @@
 set -euo pipefail
 
 # 基础配置模块：命令行参数可以覆盖同名环境变量提供的默认值。
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CALLER_DIR="${PWD}"
+PROJECT_ROOT="$(realpath -m -- "$(dirname "${BASH_SOURCE[0]}")")"
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
 CLIENT_CONFIG="${CLIENT_CONFIG:-${PROJECT_ROOT}/config/rpc_client.json}"
 SERVER_CONFIG="${SERVER_CONFIG:-${PROJECT_ROOT}/config/rpc_server.json}"
@@ -13,7 +14,7 @@ PAYLOAD_SIZE="${PAYLOAD_SIZE:-64}"
 BUILD_FIRST="${BUILD_FIRST:-0}"
 START_SERVER="${START_SERVER:-0}"
 SERVER_PID=""
-SERVER_LOG="${BUILD_DIR}/stress_test_server.log"
+SERVER_LOG="${SERVER_LOG:-}"
 
 # 帮助模块：说明脚本能够管理的构建、服务端和压测参数。
 usage() {
@@ -28,11 +29,13 @@ Options:
   --payload-size N       Echo message size in bytes (default: 64)
   --client-config PATH   RPC client config file
   --server-config PATH   RPC server config file used with --start-server
+  --build-dir PATH       Build directory (default: project build/)
+  --server-log PATH      Log file used with --start-server
   --help                 Show this help message
 
 The script requires ZooKeeper and a registered RPC service. Parameters can
 also be set with BUILD_DIR, BUILD_FIRST, START_SERVER, THREADS, REQUESTS,
-PAYLOAD_SIZE, CLIENT_CONFIG, and SERVER_CONFIG environment variables.
+PAYLOAD_SIZE, CLIENT_CONFIG, SERVER_CONFIG, and SERVER_LOG environment variables.
 EOF
 }
 
@@ -86,6 +89,16 @@ while [[ $# -gt 0 ]]; do
       SERVER_CONFIG="$2"
       shift 2
       ;;
+    --build-dir)
+      require_value "$@"
+      BUILD_DIR="$2"
+      shift 2
+      ;;
+    --server-log)
+      require_value "$@"
+      SERVER_LOG="$2"
+      shift 2
+      ;;
     --help)
       usage
       exit 0
@@ -95,6 +108,17 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# 路径始终按调用者工作目录解释，在构建或子进程 cd 前完成规范化。
+absolute_path() {
+  if [[ "$1" = /* ]]; then realpath -m -- "$1"
+  else realpath -m -- "${CALLER_DIR}/$1"
+  fi
+}
+CLIENT_CONFIG="$(absolute_path "${CLIENT_CONFIG}")"
+SERVER_CONFIG="$(absolute_path "${SERVER_CONFIG}")"
+BUILD_DIR="$(absolute_path "${BUILD_DIR}")"
+SERVER_LOG="$(absolute_path "${SERVER_LOG:-${BUILD_DIR}/stress_test_server.log}")"
 
 # 构建检查模块：显式要求构建或缺少目标程序时，复用项目构建脚本。
 [[ -f "${CLIENT_CONFIG}" ]] || fail "client config not found: ${CLIENT_CONFIG}"
@@ -121,6 +145,7 @@ if [[ "${START_SERVER}" == "1" ]]; then
     fail "RPC server not found: ${BUILD_DIR}/rpc_server"
 
   echo "Starting local RPC server (log: ${SERVER_LOG})..."
+  mkdir -p -- "$(dirname "${SERVER_LOG}")"
   (
     cd "${BUILD_DIR}"
     exec ./rpc_server "${SERVER_CONFIG}"

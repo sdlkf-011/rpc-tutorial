@@ -1,12 +1,17 @@
+#ifndef RPC_TUTORIAL_RPC_SRC_NETWORK_MESSAGE_CYCLE_H_
+#define RPC_TUTORIAL_RPC_SRC_NETWORK_MESSAGE_CYCLE_H_
+
 #include <netinet/tcp.h>
 #include <pthread.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 
 // 系统相关头文件
 #ifdef __APPLE__
@@ -43,7 +48,19 @@ class MessageCycle {
                              const RpcRequest& request);
 
  private:
-  pthread_t thread_id_;
+  struct Notifications;
+  struct Client {
+    std::shared_ptr<Connection> connection;
+    bool subscribed = true;
+    bool read_enabled = true;
+    bool write_enabled = false;
+  };
+  std::shared_ptr<Notifications> notifications_;
+  std::unordered_map<uint64_t, Client> clients_;
+  std::atomic<bool> stop_requested_{false};
+  std::mutex loop_mutex_;
+  std::condition_variable loop_cv_;
+  static constexpr size_t kSendBudget = 64 * 1024;
   std::set<int> listen_fds_;
   std::atomic<bool> running_;
   mutable std::mutex mutex_;
@@ -63,8 +80,11 @@ class MessageCycle {
 #endif
 
   void HandleNewConnection(int fd);
-  void HandleClientData(int fd);
-  void RemoveConnection(int fd);
+  void HandleClientData(uint64_t id);
+  void FlushConnection(uint64_t id);
+  bool UpdateInterest(uint64_t id);
+  void RemoveConnection(uint64_t id);
+  void ProcessNotifications();
 
   ConnectionManager* connection_manager_;
   static const int MAX_EVENTS = 1024;
@@ -91,3 +111,5 @@ class MessageCycle {
                             const RpcRequest& request);
 };
 }  // namespace cookrpc
+
+#endif  // RPC_TUTORIAL_RPC_SRC_NETWORK_MESSAGE_CYCLE_H_

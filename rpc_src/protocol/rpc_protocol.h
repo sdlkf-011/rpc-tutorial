@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -15,6 +16,9 @@ struct RpcHeader {
   uint32_t sequence_id;     // 序列号
 
   static const uint32_t MAGIC;  // 魔数常量定义
+  static constexpr size_t kHeaderSize = 12;
+  static constexpr size_t kMaxBodySize = 1024 * 1024;
+  static constexpr size_t kMaxFrameSize = kHeaderSize + kMaxBodySize;
 };
 
 // RPC 消息基类
@@ -95,6 +99,9 @@ class RpcResponse : public RpcMessage {
 
   // 实现基类的纯虚函数
   bool Serialize(std::string& out) const override;
+
+  // 所有响应发送入口使用此方法：超限转换为保留序列号的短协议错误。
+  bool SerializeForSend(std::string& out) const;
   bool Deserialize(const std::string& in) override;
 
  private:

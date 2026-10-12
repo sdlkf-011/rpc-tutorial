@@ -1,19 +1,12 @@
 #include "zk_conn_handler.h"
 
-#include <zookeeper/zookeeper.h>
-#include <zookeeper/zookeeper.jute.h>
-
-#include <atomic>
-#include <cerrno>
 #include <chrono>
-#include <cstring>
+#include <condition_variable>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
-#include <nlohmann/json_fwd.hpp>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -23,114 +16,221 @@
 
 namespace cookrpc {
 
+struct ZkConnHandler::Session {
+  zhandle_t* handle = nullptr;
+  std::mutex state_mutex;
+  std::condition_variable state_cv;
+  int state = ZOO_CONNECTING_STATE;
+
+  ~Session() {
+    // close 可能等待 watcher；此时不持有状态锁或发现器的锁
+    // 上下文成员在 close 返回前始终存活
+    if (handle != nullptr) {
+      zookeeper_close(handle);
+    }
+  }
+
+  bool WaitConnected(int retry_interval_seconds) {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    state_cv.wait_for(lock, std::chrono::seconds(3LL * retry_interval_seconds),
+                      [this] {
+                        return state == ZOO_CONNECTED_STATE ||
+                               state == ZOO_EXPIRED_SESSION_STATE ||
+                               state == ZOO_AUTH_FAILED_STATE;
+                      });
+    return state == ZOO_CONNECTED_STATE;
+  }
+
+  bool IsTerminal() {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    return state == ZOO_EXPIRED_SESSION_STATE || state == ZOO_AUTH_FAILED_STATE;
+  }
+};
+
+std::string ZkConnHandler::Configuration::Endpoint() const {
+  return host + ":" + std::to_string(port);
+}
+
+bool ZkConnHandler::Configuration::IsValid() const {
+  return !host.empty() && host.find('\0') == std::string::npos && port > 0 &&
+         port <= 65535 && !zk_namespace.empty() &&
+         zk_namespace.front() == '/' &&
+         zk_namespace.find('\0') == std::string::npos &&
+         retry_interval_seconds > 0;
+}
+
+std::shared_ptr<ZkConnHandler::Session> ZkConnHandler::CreateSession(
+    const Configuration& config) {
+  auto session = std::make_shared<Session>();
+  const std::string endpoint = config.Endpoint();
+  // 每个句柄只更新自己的 Session，回调不会访问 handler 或其他会话。
+  session->handle = zookeeper_init(endpoint.c_str(), GlobalWatcher, 30000,
+                                   nullptr, session.get(), 0);
+  if (!session->handle ||
+      !session->WaitConnected(config.retry_interval_seconds)) {
+    LOG_ERROR("Failed to connect to ZooKeeper at {}", endpoint);
+    return nullptr;
+  }
+  return session;
+}
+
 bool ZkConnHandler::InitZkConnHandler(const nlohmann::json& config) {
   try {
-    // 检查配置的有效性
-    if (config.empty()) {
-      LOG_ERROR("Empty configuration");
+    if (!config.is_object() || config.empty()) {
+      LOG_ERROR("Empty or invalid ZooKeeper configuration");
       return false;
     }
-
-    // 安全的读取参数配置
-    try {
-      std::string zk_host = config.value("zk_host", "localhost");
-      SetZkHost(zk_host);
-
-      int zk_port = config.value("zk_port", 2181);
-      SetZkPort(zk_port);
-
-      SetZkNamespace(config.value("zk_namespace", "/cookrpc"));
-      SetZkRetryInterval(config.value("zk_retry_interval", 5));
-    } catch (const nlohmann::json::exception& e) {
-      LOG_ERROR("Failed to parse configuration: {}", e.what());
-      CleanUp();
+    // 先完整解析和校验，任何失败均不修改已提交配置或句柄
+    Configuration candidate;
+    candidate.host = config.value("zk_host", "localhost");
+    candidate.port = config.value("zk_port", 2181);
+    candidate.zk_namespace = config.value("zk_namespace", "/cookrpc");
+    candidate.retry_interval_seconds = config.value("zk_retry_interval", 5);
+    if (!candidate.IsValid()) {
+      LOG_ERROR("Invalid ZooKeeper configuration");
       return false;
     }
-
-    // 尝试建立连接
-    bool is_connected = EnsureZkConnection();
-
-    if (!is_connected) {
-      LOG_ERROR("Failed to connect to ZooKeeper after retries");
-      return false;
-    }
-
-    return true;
+    return CommitConfiguration(std::move(candidate));
   } catch (const std::exception& e) {
-    LOG_ERROR("Exception in initZkConnHandler: {}", e.what());
-    CleanUp();
+    LOG_ERROR("Failed to initialize ZooKeeper discovery: {}", e.what());
     return false;
   }
 }
 
+bool ZkConnHandler::CommitConfiguration(Configuration config) {
+  // 将待销毁对象声明在锁之前，保证锁释放后才关闭旧会话
+  std::shared_ptr<Session> session;
+  std::shared_ptr<ServiceRegistry> old_registry;
+  std::lock_guard<std::mutex> update_lock(update_mutex_);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (config.Endpoint() == config_.Endpoint() && session_ &&
+        !session_->IsTerminal()) {
+      session = session_;
+    }
+  }
+  if (session) {
+    if (!session->WaitConnected(config.retry_interval_seconds)) {
+      return false;
+    }
+  } else {
+    session = CreateSession(config);
+    if (!session) {
+      return false;
+    }
+  }
+
+  // 拷贝可能分配内存，须在提交之前完成
+  Configuration pending = config;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (session != session_) {
+      old_registry = std::move(service_registry_);
+    }
+    std::swap(config_, config);
+    std::swap(pending_config_, pending);
+    session_.swap(session);
+  }
+  return true;
+}
+
+std::shared_ptr<ZkConnHandler::Session> ZkConnHandler::GetConnectedSession() {
+  std::shared_ptr<Session> session;
+  Configuration config;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    session = session_;
+    config = config_;
+  }
+  if (session) {
+    if (session->WaitConnected(config.retry_interval_seconds)) {
+      return session;
+    }
+    if (!session->IsTerminal()) {
+      return nullptr;
+    }
+  }
+
+  // 首次惰性连接和失效会话重建与配置切换、清理互斥
+  std::shared_ptr<Session> old_session;
+  std::lock_guard<std::mutex> update_lock(update_mutex_);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    old_session = std::move(session);
+    session = session_;
+    config = session ? config_ : pending_config_;
+  }
+  if (session && !session->IsTerminal()) {
+    return session->WaitConnected(config.retry_interval_seconds) ? session
+                                                                 : nullptr;
+  }
+  if (!config.IsValid()) {
+    return nullptr;
+  }
+  auto replacement = CreateSession(config);
+  if (!replacement) {
+    return nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    config_ = std::move(config);
+    session_ = replacement;
+  }
+  return replacement;
+}
+
+bool ZkConnHandler::EnsureZkConnection() {
+  return GetConnectedSession() != nullptr;
+}
+
 std::vector<std::string> ZkConnHandler::GetAllServers(
     const std::string& zk_namespace) {
-  // 确保 ZooKeeper 连接可用
-  if (!EnsureZkConnection()) {
+  const auto session = GetConnectedSession();
+  if (!session) {
     LOG_ERROR("ZooKeeper connection not available");
     return {};
   }
 
-  // 保护客户端句柄，避免清理期间继续访问旧句柄。
-  std::lock_guard<std::mutex> client_lock(mutex_);
-  if (zk_client_ == nullptr) {
-    return {};
-  }
+  // 查询全程持有同一会话快照，配置切换与 CleanUp 不会关闭它。
+  struct Children {
+    String_vector value{0, nullptr};
+    ~Children() { deallocate_String_vector(&value); }
+  } children;
 
   try {
-    struct String_vector children = {0, nullptr};
-
-    // 获取指定路径下的所有子节点
-    int rc = zoo_get_children(zk_client_, zk_namespace.c_str(), 0, &children);
-
+    int rc = zoo_get_children(session->handle, zk_namespace.c_str(), 0,
+                              &children.value);
     if (rc != ZOK) {
-      LOG_ERROR("Failed to get chilren: {}", zerror(rc));
+      LOG_ERROR("Failed to get children: {}", zerror(rc));
       return {};
     }
-
     std::vector<std::string> servers;
-
-    // 遍历每个子节点, 获取服务器地址
-    for (int i = 0; i < children.count; ++i) {
-      std::string node_path = zk_namespace + "/" + children.data[i];
+    for (int i = 0; i < children.value.count; ++i) {
+      const std::string node_path = (zk_namespace == "/" ? "" : zk_namespace) +
+                                    "/" + children.value.data[i];
       char buffer[1024];
       int buffer_len = sizeof(buffer);
-
-      // 获取节点的数量
-      int rc = zoo_get(zk_client_, node_path.c_str(), 0, buffer, &buffer_len,
-                       nullptr);
-      if (rc == ZOK && buffer_len > 0) {
-        std::string server_ip(buffer, buffer_len);
-        servers.push_back(server_ip);
+      rc = zoo_get(session->handle, node_path.c_str(), 0, buffer, &buffer_len,
+                   nullptr);
+      if (rc == ZOK && buffer_len > 0 &&
+          buffer_len <= static_cast<int>(sizeof(buffer))) {
+        servers.emplace_back(buffer, buffer_len);
       } else {
         LOG_WARN("Failed to get data for node: {}, error: {}", node_path,
                  zerror(rc));
       }
     }
-
-    // 释放 ZooKeeper 分配的内容
-    deallocate_String_vector(&children);
     return servers;
   } catch (const std::exception& e) {
-    LOG_ERROR("Exception in getAllServers: {}", e.what());
+    LOG_ERROR("Exception in GetAllServers: {}", e.what());
     return {};
   }
 }
 
 std::string ZkConnHandler::GetServer(const std::string& zk_namespace) {
-  // 更新服务器
-  UpdateServersFromZk(zk_namespace);
-
-  std::lock_guard<std::mutex> lock(servers_mutex_);
-
-  if (servers_.empty()) {
-    LOG_ERROR("No acailable servers");
-    return "";
-  }
-
-  // 使用负载均衡器选择服务器
-  std::string server = LoadBalancer::SelectServer(servers_);
-  return server;
+  // 本次命名空间对应的局部列表直接交给策略，避免跨请求共享缓存。
+  const auto servers = GetAllServers(zk_namespace);
+  return LoadBalancer::SelectServer(servers);
 }
 
 bool ZkConnHandler::RegisterService(const std::string& service_name,
@@ -205,244 +305,80 @@ bool ZkConnHandler::ReisterServicesFromConfig(
 }
 
 std::shared_ptr<ServiceRegistry> ZkConnHandler::GetOrCreateServiceRegistry() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!service_registry_) {
-    if (!CreateServiceRegistryIfNeeded()) {
+  std::shared_ptr<ServiceRegistry> registry;
+  std::lock_guard<std::mutex> update_lock(update_mutex_);
+  Configuration config;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (service_registry_) {
+      return service_registry_;
+    }
+    config = config_;
+  }
+  try {
+    // 建连期间不持有快照锁；事务锁保证注册器与提交的端点一致。
+    registry = std::make_shared<ServiceRegistry>(config.Endpoint());
+    if (!registry->IsConnected()) {
       return nullptr;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
+    service_registry_ = registry;
+    return registry;
+  } catch (const std::exception& e) {
+    LOG_ERROR("Exception creating ServiceRegistry: {}", e.what());
+    return nullptr;
   }
-  return service_registry_;
 }
 
 void ZkConnHandler::SetZkHost(const std::string& host) {
+  std::lock_guard<std::mutex> update_lock(update_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
-  try {
-    if (host.empty()) {
-      LOG_WARN("Empty host provided, using default");
-      zk_host_ = "localhost";
-    } else {
-      zk_host_ = host;
-    }
-  } catch (const std::exception& e) {
-    LOG_ERROR("Failed to set ZooKeeper host: {}", e.what());
-    zk_host_ = "localhost";
-  }
+  pending_config_.host = host;
 }
 
 void ZkConnHandler::SetZkPort(int port) {
+  std::lock_guard<std::mutex> update_lock(update_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
-  zk_port_ = (port > 0 && port < 65536) ? port : 2181;
+  pending_config_.port = port;
 }
 
 void ZkConnHandler::SetZkRetryInterval(int seconds) {
+  std::lock_guard<std::mutex> update_lock(update_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
-  retry_interval_ = std::chrono::seconds(seconds);
+  pending_config_.retry_interval_seconds = seconds;
 }
 
 void ZkConnHandler::SetZkNamespace(const std::string& zk_namespace) {
+  std::lock_guard<std::mutex> update_lock(update_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
-  zk_namespace_ = zk_namespace;
-}
-
-bool ZkConnHandler::EnsureZkConnection() {
-  // zookeeper_init() 只创建句柄，实际连接由 ZooKeeper 后台线程异步完成。
-  if (!InitZkClient()) {
-    return false;
-  }
-
-  // 等待连接建立
-  int retry_count = 0;
-  const int max_retries = 3;
-
-  while (retry_count++ < max_retries) {
-    int state = 0;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (zk_client_ == nullptr) {
-        return false;
-      }
-      state = zoo_state(zk_client_);
-    }
-    const char* state_desc;
-
-    // 状态描述
-    if (state == ZOO_CONNECTED_STATE) {
-      state_desc = "CONNECTED";
-    } else if (state == ZOO_CONNECTING_STATE) {
-      state_desc = "CONNECTING";
-    } else if (state == ZOO_EXPIRED_SESSION_STATE) {
-      state_desc = "EXPIRED";
-    } else if (state == ZOO_AUTH_FAILED_STATE) {
-      state_desc = "AUTH_FAILED";
-    } else if (state == ZOO_ASSOCIATING_STATE) {
-      state_desc = "ASSOCIATING";
-    } else {
-      state_desc = "UNKNOWN";
-      // 诊断信息
-      LOG_WARN("Unexpected state value: {} (0x{:x})", state, state);
-      bool client_valid = false;
-      int exists_result = ZINVALIDSTATE;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        client_valid = zk_client_ != nullptr;
-        if (client_valid) {
-          // 尝试一个简单的操作测试连接
-          struct Stat stat {};
-          exists_result = zoo_exists(zk_client_, "/", 0, &stat);
-        }
-      }
-      LOG_WARN("Client handle valid: {}", client_valid);
-
-      if (client_valid) {
-        // 记录连接探测结果，便于诊断 ZooKeeper 状态转换。
-        LOG_WARN("zoo_exists test result: {}", exists_result);
-      }
-    }
-
-    // 连接成功
-    if (state == ZOO_CONNECTED_STATE) {
-      return true;
-    }
-
-    // 不可恢复的错误状态
-    if (state == ZOO_EXPIRED_SESSION_STATE || state == ZOO_AUTH_FAILED_STATE ||
-        (state != ZOO_CONNECTED_STATE && retry_count > 10)) {
-      LOG_ERROR("Connection failed with state: {} ({})", state, state_desc);
-      CleanUp();
-      return false;
-    }
-
-    // 短暂等待后重试
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
-
-  LOG_ERROR("Failed to connect after {} retries", max_retries);
-  CleanUp();
-  return false;
-}
-
-void ZkConnHandler::UpdateServersFromZk(const std::string& zk_namespace) {
-  auto new_servers = GetAllServers(zk_namespace);
-  {
-    std::lock_guard<std::mutex> lock(servers_mutex_);
-    servers_ = std::move(new_servers);
-  }
+  pending_config_.zk_namespace = zk_namespace;
 }
 
 void ZkConnHandler::CleanUp() {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  // 清理 ServiceRegistry 实例
-  service_registry_.reset();
-
-  // 清理 ZooKeeper 客户端连接
-  if (zk_client_) {
-    try {
-      zookeeper_close(zk_client_);
-      zk_client_ = nullptr;
-    } catch (const std::exception& e) {
-      zk_client_ = nullptr;
-    } catch (...) {
-      zk_client_ = nullptr;
-    }
+  std::shared_ptr<Session> old_session;
+  std::shared_ptr<ServiceRegistry> old_registry;
+  {
+    std::lock_guard<std::mutex> update_lock(update_mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    old_session = std::move(session_);
+    old_registry = std::move(service_registry_);
   }
 
-  // 重置运行状态
-  running_ = false;
+  // 最后一个所有者在所有锁之外关闭句柄
 }
 
 ZkConnHandler::~ZkConnHandler() { CleanUp(); }
 
-void ZkConnHandler::GlobalWatcher(zhandle_t* zh, int type, int state,
-                                  const char* path, void* watcherCtx) {
-  (void)zh;
-  (void)path;
-
-  // 目前主要处理会话事件
-  if (type == ZOO_SESSION_EVENT) {
-    auto* handler = static_cast<ZkConnHandler*>(watcherCtx);
-    if (handler) {
-      handler->running_.store(state == ZOO_CONNECTED_STATE,
-                              std::memory_order_release);
-    }
-
-    const char* state_desc;
-
-    // 状态描述，便于日志记录和调试
-    if (state == ZOO_CONNECTED_STATE) {
-      state_desc = "CONNECTED";
-    } else if (state == ZOO_CONNECTING_STATE) {
-      state_desc = "CONNECTING";
-    } else if (state == ZOO_EXPIRED_SESSION_STATE) {
-      state_desc = "EXPIRED";
-    } else if (state == ZOO_AUTH_FAILED_STATE) {
-      state_desc = "AUTH_FAILED";
-    } else if (state == ZOO_ASSOCIATING_STATE) {
-      state_desc = "ASSOCIATING";
-    } else {
-      state_desc = "UNKNOWN";
-    }
-
-    LOG_INFO("ZooKeeper session state changed: {}", state_desc);
+void ZkConnHandler::GlobalWatcher(zhandle_t*, int type, int state, const char*,
+                                  void* watcher_context) {
+  if (type != ZOO_SESSION_EVENT || watcher_context == nullptr) {
+    return;
   }
-}
-
-bool ZkConnHandler::CreateServiceRegistryIfNeeded() {
-  try {
-    // 构建 ZooKeeper 连接字符串
-    std::string zk_connection = zk_host_ + ":" + std::to_string(zk_port_);
-
-    // 创建 ServiceRegistry 实例
-    service_registry_ = std::make_shared<ServiceRegistry>(zk_connection);
-
-    // 等待连接创建
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-    // 验证连接状态
-    if (!service_registry_->IsConnected()) {
-      LOG_ERROR("Failed to connect ServiceRegistry to ZooKeeper at {}",
-                zk_connection);
-      service_registry_.reset();
-      return false;
-    }
-
-    return true;
-  } catch (const std::exception& e) {
-    LOG_ERROR("Exception creating ServiceRegistry: {}", e.what());
-    service_registry_.reset();
-    return false;
+  auto* session = static_cast<Session*>(watcher_context);
+  {
+    std::lock_guard<std::mutex> lock(session->state_mutex);
+    session->state = state;
   }
-}
-
-bool ZkConnHandler::InitZkClient() {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  // 惰性初始化可能被多个请求同时触发，已有句柄时直接复用。
-  if (zk_client_ != nullptr) {
-    return true;
-  }
-
-  if (zk_host_.empty() || zk_port_ <= 0 || zk_port_ >= 65536) {
-    LOG_ERROR("Invalid ZooKeeper endpoint: host='{}', port={}", zk_host_,
-              zk_port_);
-    return false;
-  }
-
-  const std::string connection = zk_host_ + ":" + std::to_string(zk_port_);
-
-  running_.store(false, std::memory_order_release);
-  errno = 0;
-  zhandle_t* client = zookeeper_init(connection.c_str(), GlobalWatcher, 30000,
-                                     nullptr, this, 0);
-  if (client == nullptr) {
-    const int error_number = errno;
-    LOG_ERROR("Failed to initialize ZooKeeper client for {}: {} (errno: {})",
-              connection, std::strerror(error_number), error_number);
-    return false;
-  }
-
-  zk_client_ = client;
-  LOG_INFO("ZooKeeper client initialized for {}", connection);
-  return true;
+  session->state_cv.notify_all();
 }
 }  // namespace cookrpc

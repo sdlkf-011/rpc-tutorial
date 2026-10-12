@@ -21,14 +21,18 @@ class ThreadPoolSingleton {
   static bool Init(size_t threads = std::thread::hardware_concurrency());
   static bool Init(const ThreadPoolStruct& config);
 
-  static ThreadPool& GetInstance();
-  static ThreadPool& GetInstance(const ThreadPoolStruct& config);
+  // 销毁期间返回 nullptr；调用方持有句柄才能使用池。
+  static std::shared_ptr<ThreadPool> GetInstance();
+  static std::shared_ptr<ThreadPool> GetInstance(
+      const ThreadPoolStruct& config);
 
   template <typename F, typename... Args>
   static auto Enqueue(TaskPriority priority, F&& f, Args&&... args)
       -> std::future<std::invoke_result_t<F, Args...>> {
-    return GetInstance().Enqueue(priority, std::forward<F>(f),
-                                 std::forward<Args>(args)...);
+    const auto pool = GetInstance();
+    return pool ? pool->Enqueue(priority, std::forward<F>(f),
+                                std::forward<Args>(args)...)
+                : std::future<std::invoke_result_t<F, Args...>>{};
   }
 
   static ThreadPool::Stats GetStats();
@@ -39,8 +43,12 @@ class ThreadPoolSingleton {
   static bool Resume();
   static bool Shutdown(
       std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
+  static bool RequestShutdown();
+  static bool WaitForTermination(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
 
-  static void Destroy();
+  // worker 或其他销毁者调用时返回 false；外部调用排空并回收旧池。
+  static bool Destroy();
   static bool Exists();
   static ThreadPoolState GetState();
 
@@ -50,8 +58,10 @@ class ThreadPoolSingleton {
  private:
   ThreadPoolSingleton() = default;
 
-  static std::unique_ptr<ThreadPool> instance_;
+  static std::shared_ptr<ThreadPool> Snapshot();
+  static std::shared_ptr<ThreadPool> instance_;
   static std::mutex mutex_;  // 全局互斥锁
+  static bool destroying_;
 };
 }  // namespace meeting_ctrl
 
