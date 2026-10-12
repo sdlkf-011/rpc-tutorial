@@ -1,33 +1,17 @@
 #include "rpc_client_config.h"
 
 #include <fstream>
-#include <limits>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 
+#include "config_validation.h"
 #include "log_manager.h"
 
 namespace cookrpc {
 namespace {
 void Require(bool valid, const char* message) {
   if (!valid) throw std::invalid_argument(message);
-}
-int ReadInteger(const nlohmann::json& config, const char* key, int fallback) {
-  if (!config.contains(key)) return fallback;
-  const auto& value = config.at(key);
-  Require(value.is_number_integer(), "Configuration field must be an integer");
-  if (value.is_number_unsigned()) {
-    const auto integer = value.get<uint64_t>();
-    Require(integer <= static_cast<uint64_t>(std::numeric_limits<int>::max()),
-            "Configuration integer is out of range");
-    return static_cast<int>(integer);
-  }
-  const auto integer = value.get<int64_t>();
-  Require(integer >= std::numeric_limits<int>::min() &&
-              integer <= std::numeric_limits<int>::max(),
-          "Configuration integer is out of range");
-  return static_cast<int>(integer);
 }
 }  // namespace
 
@@ -70,10 +54,14 @@ bool RpcClientConfig::InitRpcClientConfig(const std::string& filename) {
     RpcClientConfig candidate;
     candidate.SetZkHost(json.value("zk_host", "localhost"));
     candidate.SetZkNamespace(json.value("zk_namespace", "/cookrpc"));
-    candidate.SetZkPort(ReadInteger(json, "zk_port", 2181));
-    candidate.SetTimeout(ReadInteger(json, "timeout_ms", 3000));
-    candidate.SetRetryTimes(ReadInteger(json, "retry_times", 3));
-    candidate.SetServerPort(ReadInteger(json, "server_port", 8989));
+    candidate.SetZkPort(
+        config_validation::ReadInteger(json, "zk_port", 2181, 1, 65535));
+    candidate.SetTimeout(
+        config_validation::ReadInteger(json, "timeout_ms", 3000, 1, INT32_MAX));
+    candidate.SetRetryTimes(
+        config_validation::ReadInteger(json, "retry_times", 3, 0, 100));
+    candidate.SetServerPort(
+        config_validation::ReadInteger(json, "server_port", 8989, 1, 65535));
     // 提交只进行无异常的交换和整数赋值，失败不会留下半份新配置。
     zk_host_.swap(candidate.zk_host_);
     zk_namespace_.swap(candidate.zk_namespace_);

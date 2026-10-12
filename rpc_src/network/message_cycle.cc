@@ -141,8 +141,9 @@ struct MessageCycle::Notifications {
   }
 };
 
-MessageCycle::MessageCycle(ConnectionManager* manager)
+MessageCycle::MessageCycle(ConnectionManager* manager, size_t max_connections)
     : notifications_(std::make_shared<Notifications>()),
+      max_connections_(max_connections),
       running_(false),
 #ifdef __APPLE__
       kqueue_fd_(kqueue()),
@@ -394,19 +395,24 @@ void MessageCycle::HandleEpollEvents(struct epoll_event* events, int count) {
 #endif
 
 void MessageCycle::HandleNewConnection(int fd) {
-  // 新连接模块：排空监听队列，配置客户端 fd，注册回调后加入事件循环。
-  while (running_.load() && !stop_requested_.load()) {
-    int client_fd = -1;
-    do {
-      client_fd = accept(fd, nullptr, nullptr);
-    } while (client_fd < 0 && errno == EINTR);
+  // LT 后端会再次报告可读；每轮限制 accept 次数，给已有连接处理机会。
+  for (size_t accepted = 0;
+       accepted < kAcceptBudget && running_.load() && !stop_requested_.load();
+       ++accepted) {
+    const int client_fd = accept(fd, nullptr, nullptr);
 
     if (client_fd < 0) {
+      if (errno == EINTR) continue;
       if (errno != EAGAIN && errno != EWOULDBLOCK) {
         LOG_ERROR("Failed to accept connection on fd {}: {}", fd,
                   std::strerror(errno));
       }
       return;
+    }
+
+    if (clients_.size() >= max_connections_) {
+      close(client_fd);
+      continue;
     }
 
     if (!SetNonBlockingAndCloseOnExec(client_fd)) {

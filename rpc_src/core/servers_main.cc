@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 
+#include "config_validation.h"
 #include "create_socket.h"
 #include "log_manager.h"
 #include "message_cycle.h"
@@ -70,8 +71,8 @@ bool InitializeServiceRegistry(
     // 调度配置使用毫秒，ZooKeeper 处理器使用秒。
     // 此处完成单位适配。
     nlohmann::json scheduler_config = config["scheduler"];
-    const int retry_interval_ms =
-        scheduler_config.value("retry_interval", 1000);
+    const int retry_interval_ms = cookrpc::config_validation::ReadInteger(
+        scheduler_config, "retry_interval", 1000, 1, INT32_MAX);
     scheduler_config["zk_retry_interval"] =
         std::max(1, retry_interval_ms / 1000);
 
@@ -151,7 +152,8 @@ int main(int argc, char* argv[]) {
   }
 
   cookrpc::MessageCycle message_cycle(
-      &cookrpc::ConnectionManager::GetInstance());
+      &cookrpc::ConnectionManager::GetInstance(),
+      server_config.GetMaxConnections());
   if (!message_cycle.AddListenFd(server_socket->GetFd())) {
     LOG_FATAL("Failed to add server socket to the message cycle");
     meeting_ctrl::ThreadPoolSingleton::Destroy();

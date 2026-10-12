@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "config_validation.h"
 #include "load_balancer.h"
 #include "log_manager.h"
 #include "registry_config.h"
@@ -83,9 +84,11 @@ bool ZkConnHandler::InitZkConnHandler(const nlohmann::json& config) {
     // 先完整解析和校验，任何失败均不修改已提交配置或句柄
     Configuration candidate;
     candidate.host = config.value("zk_host", "localhost");
-    candidate.port = config.value("zk_port", 2181);
+    candidate.port =
+        config_validation::ReadInteger(config, "zk_port", 2181, 1, 65535);
     candidate.zk_namespace = config.value("zk_namespace", "/cookrpc");
-    candidate.retry_interval_seconds = config.value("zk_retry_interval", 5);
+    candidate.retry_interval_seconds = config_validation::ReadInteger(
+        config, "zk_retry_interval", 5, 1, INT32_MAX);
     if (!candidate.IsValid()) {
       LOG_ERROR("Invalid ZooKeeper configuration");
       return false;

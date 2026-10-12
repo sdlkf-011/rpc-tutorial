@@ -1,6 +1,7 @@
 #include "zk_conn_handler.h"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -427,3 +429,27 @@ TEST_F(DiscoveryTest,
   }
 }
 }  // namespace
+
+TEST_F(DiscoveryTest,
+       RpcClientRejectsInvalidNumericTypesBeforeSwitchingCluster) {
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("rpc-client-numeric-" + std::to_string(getpid()) + ".json");
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() { std::filesystem::remove(path); }
+  } cleanup{path};
+  std::ofstream(path) << Config("A");
+  cookrpc::RpcClient client(path.string());
+  for (const auto* field : {"zk_port", "server_port", "timeout_ms",
+                            "retry_times", "zk_retry_interval"}) {
+    for (const auto& bad :
+         {nlohmann::json(true), nlohmann::json(1.5),
+          nlohmann::json(std::numeric_limits<uint64_t>::max())}) {
+      auto candidate = Config("B");
+      candidate[field] = bad;
+      std::ofstream(path) << candidate;
+      EXPECT_FALSE(client.LoadConfig(path.string())) << field << '=' << bad;
+    }
+  }
+}

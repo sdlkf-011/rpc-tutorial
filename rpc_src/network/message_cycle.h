@@ -31,7 +31,8 @@ namespace cookrpc {
 // 跨平台网络事件循环：统一处理监听 fd、客户端读事件及 RPC 分发。
 class MessageCycle {
  public:
-  MessageCycle(ConnectionManager* manager);
+  explicit MessageCycle(ConnectionManager* manager,
+                        size_t max_connections = 10000);
   virtual ~MessageCycle();
 
   // 注册/注销监听文件描述符。
@@ -61,6 +62,8 @@ class MessageCycle {
   std::mutex loop_mutex_;
   std::condition_variable loop_cv_;
   static constexpr size_t kSendBudget = 64 * 1024;
+  static constexpr size_t kAcceptBudget = 64;
+  const size_t max_connections_;
   std::set<int> listen_fds_;
   std::atomic<bool> running_;
   mutable std::mutex mutex_;

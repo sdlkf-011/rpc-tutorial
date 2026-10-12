@@ -1,72 +1,53 @@
 #include "rpc_server_config.h"
 
-#include <exception>
 #include <fstream>
 #include <nlohmann/json.hpp>
-#include <nlohmann/json_fwd.hpp>
-#include <string>
 
+#include "config_validation.h"
 #include "log_manager.h"
 #include "utils_fun.h"
 
 namespace cookrpc {
-
-bool RpcServerConfig::InitRpcServerConfig(const std::string& config_file) {
+bool RpcServerConfig::InitRpcServerConfig(const std::string& filename) {
   try {
-    // 打开文件
-    std::ifstream file(config_file);
-    if (!file.is_open()) {
-      LOG_ERROR("Failed to open config file: {}", config_file);
+    std::ifstream file(filename);
+    if (!file.is_open()) return false;
+    const auto json = nlohmann::json::parse(file);
+    using config_validation::ReadInteger;
+    // 包含所有子配置的候选对象；提交前不改变当前对象或子对象。
+    RpcServerConfig candidate;
+    candidate.servers_name_prefix_ =
+        config_validation::ReadString(json, "servers_name_prefix", "cookrpc");
+    candidate.servers_ip_ =
+        config_validation::ReadString(json, "servers_ip", "0.0.0.0");
+    config_validation::Require(IsValidIpAddress(candidate.servers_ip_),
+                               "Invalid server IP address");
+    candidate.servers_port_ = static_cast<uint16_t>(
+        ReadInteger(json, "servers_port", 8989, 1, 65535));
+    candidate.max_connections_ = static_cast<uint32_t>(
+        ReadInteger(json, "max_connections", 10000, 1, INT32_MAX));
+    candidate.listen_backlog_ = static_cast<uint32_t>(
+        ReadInteger(json, "listen_backlog", 1024, 1, INT32_MAX));
+    candidate.timeout_ =
+        static_cast<uint32_t>(ReadInteger(json, "timeout", 5000, 1, INT32_MAX));
+    if (!candidate.thread_pool_config_->InitThreadPoolConfig(
+            json.value("thread_pool", nlohmann::json::object())))
       return false;
-    }
-
-    // 解析 JSON
-    nlohmann::json config = nlohmann::json::parse(file);
-
-    // 加载基本配置
-    SetServersNameProfix(config.value("servers_name_prefix", "cookrpc"));
-    SetServersIp(config.value("servers_ip", "0.0.0.0"));
-    SetServersPort(config.value("servers_port", 8989));
-    SetMaxConnections(config.value("max_connections", 800000));
-    SetTimeout(config.value("timeout", 5000));
-
-    // 验证 IP 地址
-    if (servers_ip_ != "0.0.0.0" && !IsValidIpAddress(servers_ip_)) {
-      LOG_ERROR("Invalid server IP address: {}", servers_ip_);
+    if (json.contains("register_config") &&
+        !candidate.service_registry_config_->InitRegistryConfig(
+            config_validation::ReadString(json, "register_config", "")))
       return false;
-    }
-
-    //  验证端口
-    if (servers_port_ == 0) {
-      LOG_ERROR("Server port cannot be zero");
-      return false;
-    }
-
-    // 初始化线程池配置
-    if (config.contains("thread_pool")) {
-      if (!thread_pool_config_->InitThreadPoolConfig(config["thread_pool"])) {
-        LOG_ERROR("Failed to initialize thread pool config");
-        return false;
-      }
-    }
-
-    // 初始化注册配置
-    if (config.contains("register_config")) {
-      if (!service_registry_config_->InitRegistryConfig(
-              config.value("register_config", "../config/servers.json"))) {
-        LOG_ERROR("Failed to initialize registry config");
-        return false;
-      }
-    }
-
-    LOG_INFO(
-        "RpcServer config loaded: name={}, ip={}, port={}, timeout={}ms, "
-        "max_conn={}",
-        servers_name_prefix_, servers_ip_, servers_port_, timeout_,
-        max_connections_);
+    servers_name_prefix_.swap(candidate.servers_name_prefix_);
+    servers_ip_.swap(candidate.servers_ip_);
+    servers_port_ = candidate.servers_port_;
+    max_connections_ = candidate.max_connections_;
+    listen_backlog_ = candidate.listen_backlog_;
+    timeout_ = candidate.timeout_;
+    thread_pool_config_.swap(candidate.thread_pool_config_);
+    service_registry_config_.swap(candidate.service_registry_config_);
     return true;
-  } catch (const std::exception& e) {
-    LOG_ERROR("Error initializing server config: {}", e.what());
+  } catch (const std::exception& error) {
+    LOG_ERROR("Failed to load server configuration: {}", error.what());
     return false;
   }
 }

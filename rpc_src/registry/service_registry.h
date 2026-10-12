@@ -34,6 +34,15 @@ class ServiceRegistry {
   struct RecoverySignal;
   struct Session;
   struct Registration;
+  struct Operation;
+  enum class OperationKind { kCreate, kExists, kWatchExists, kGet };
+  static void CompleteString(int, const char*, const void*);
+  static void CompleteStat(int, const Stat*, const void*);
+  static void CompleteData(int, const char*, int, const Stat*, const void*);
+  std::shared_ptr<Operation> Execute(const std::shared_ptr<Session>&,
+                                     OperationKind, const std::string&,
+                                     const std::string&, int,
+                                     std::chrono::steady_clock::time_point);
   static void GlobalWatcher(zhandle_t*, int type, int state, const char*,
                             void* context);
   std::shared_ptr<Session> CreateSession();

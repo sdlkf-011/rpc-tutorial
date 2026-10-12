@@ -1,53 +1,46 @@
 #include "registry_config.h"
 
-#include <exception>
 #include <fstream>
 #include <nlohmann/json.hpp>
-#include <nlohmann/json_fwd.hpp>
-#include <string>
 
+#include "config_validation.h"
 #include "log_manager.h"
+#include "utils_fun.h"
 
 namespace cookrpc {
-
-bool ServiceRegistryConfig::InitRegistryConfig(const std::string& config_file) {
+bool ServiceRegistryConfig::InitRegistryConfig(const std::string& filename) {
   try {
-    // 打开文件
-    std::ifstream file(config_file);
-    if (!file.is_open()) {
-      LOG_ERROR("Failed to open registry config file: {}", config_file);
-      return false;
-    }
-
-    // 解析 json
-    nlohmann::json config = nlohmann::json::parse(file);
-
-    // 加载基础信息
-    SetServiceName(config.value("service_name", "cookrpc_service"));
-    SetServiceVersion(config.value("service_version", "1.0.0"));
-
-    // 加载注册节点列表
-    if (config.contains("registry_nodes") &&
-        config["registry_nodes"].is_array()) {
-      for (const auto& node : config["registry_nodes"]) {
-        RegistryInfo info;
-        info.address = node.value("address", "");
-        info.port = node.value("port", 0);
-
-        // 验证节点信息
-        if (info.address.empty() || info.port == 0) {
-          LOG_WARN("Invalid registry node, skipping");
-          continue;
-        }
-        registry_nodes_.push_back(info);
+    std::ifstream file(filename);
+    if (!file.is_open()) return false;
+    const auto json = nlohmann::json::parse(file);
+    auto name =
+        config_validation::ReadString(json, "service_name", "cookrpc_service");
+    auto version =
+        config_validation::ReadString(json, "service_version", "1.0.0");
+    config_validation::Require(
+        name != "." && name != ".." && name.find('/') == std::string::npos,
+        "Service name must be a path segment");
+    std::vector<RegistryInfo> nodes;
+    if (json.contains("registry_nodes")) {
+      config_validation::Require(json.at("registry_nodes").is_array(),
+                                 "Registry nodes must be an array");
+      for (const auto& node : json.at("registry_nodes")) {
+        auto address = config_validation::ReadString(node, "address", "");
+        config_validation::Require(IsValidIpAddress(address),
+                                   "Invalid registry IP address");
+        const auto port =
+            config_validation::ReadInteger(node, "port", 0, 1, 65535);
+        // 缺省端口同样必须校验，不能悄悄跳过错误节点。
+        config_validation::Require(port > 0, "Registry port is required");
+        nodes.push_back({std::move(address), static_cast<uint16_t>(port)});
       }
     }
-
-    LOG_INFO("Registry config loaded: service={}, version={}, nodes={}",
-             service_name_, service_version_, registry_nodes_.size());
+    service_name_.swap(name);
+    service_version_.swap(version);
+    registry_nodes_.swap(nodes);
     return true;
-  } catch (const std::exception& e) {
-    LOG_ERROR("Failed to parse registry config: {}", e.what());
+  } catch (const std::exception& error) {
+    LOG_ERROR("Failed to load registry configuration: {}", error.what());
     return false;
   }
 }

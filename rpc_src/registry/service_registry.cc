@@ -1,10 +1,10 @@
 #include "service_registry.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <stdexcept>
-#include <vector>
 
 #include "log_manager.h"
 
@@ -32,6 +32,7 @@ struct ServiceRegistry::Session {
   std::condition_variable cv;
   int state = ZOO_CONNECTING_STATE;
   uint64_t generation = 0;
+  bool retired = false;
   explicit Session(std::shared_ptr<RecoverySignal> recovery)
       : signal(std::move(recovery)) {}
   ~Session() {
@@ -39,13 +40,119 @@ struct ServiceRegistry::Session {
   }
   bool Connected() {
     std::lock_guard<std::mutex> lock(mutex);
-    return state == ZOO_CONNECTED_STATE;
+    return !retired && state == ZOO_CONNECTED_STATE;
   }
   bool Terminal() {
     std::lock_guard<std::mutex> lock(mutex);
-    return state == ZOO_EXPIRED_SESSION_STATE || state == ZOO_AUTH_FAILED_STATE;
+    return retired || state == ZOO_EXPIRED_SESSION_STATE ||
+           state == ZOO_AUTH_FAILED_STATE;
+  }
+  void Retire() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      retired = true;
+    }
+    cv.notify_all();
+    {
+      std::lock_guard<std::mutex> lock(signal->mutex);
+      signal->changed = true;
+    }
+    signal->cv.notify_all();
   }
 };
+
+// SDK completion owns a shared_ptr until completion (including close
+// cancellation). It only publishes results: no Session/Registry reference and
+// no callback-side I/O.
+struct ServiceRegistry::Operation {
+  explicit Operation(std::shared_ptr<RecoverySignal> recovery)
+      : signal(std::move(recovery)) {}
+  std::shared_ptr<RecoverySignal> signal;
+  bool done = false;  // all result fields are protected by signal->mutex
+  int rc = ZSYSTEMERROR;
+  Stat stat{};
+  std::array<char, 1024> data{};
+  int length = 0;
+};
+
+void ServiceRegistry::CompleteData(int rc, const char* data, int length,
+                                   const Stat* stat, const void* context) {
+  std::unique_ptr<std::shared_ptr<Operation>> owner(
+      static_cast<std::shared_ptr<Operation>*>(const_cast<void*>(context)));
+  const auto operation = *owner;
+  {
+    std::lock_guard<std::mutex> lock(operation->signal->mutex);
+    operation->rc = rc;
+    if (stat) operation->stat = *stat;
+    if (rc == ZOK && data) {
+      if (length < 0 || length > static_cast<int>(operation->data.size())) {
+        operation->rc = ZMARSHALLINGERROR;
+      } else {
+        operation->length = length;
+        std::memcpy(operation->data.data(), data, static_cast<size_t>(length));
+      }
+    }
+    operation->done = true;
+  }
+  operation->signal->cv.notify_all();
+}
+void ServiceRegistry::CompleteString(int rc, const char*, const void* context) {
+  CompleteData(rc, nullptr, 0, nullptr, context);
+}
+void ServiceRegistry::CompleteStat(int rc, const Stat* stat,
+                                   const void* context) {
+  CompleteData(rc, nullptr, 0, stat, context);
+}
+
+std::shared_ptr<ServiceRegistry::Operation> ServiceRegistry::Execute(
+    const std::shared_ptr<Session>& session, OperationKind kind,
+    const std::string& path, const std::string& value, int flags,
+    Clock::time_point deadline) {
+  if (Clock::now() >= deadline || signal_->stopped.load() ||
+      !session->Connected())
+    return nullptr;
+  auto operation = std::make_shared<Operation>(signal_);
+  auto* context = new std::shared_ptr<Operation>(operation);
+  int rc = ZBADARGUMENTS;
+  switch (kind) {
+    case OperationKind::kCreate:
+      rc = zoo_acreate(session->handle, path.c_str(), value.data(),
+                       static_cast<int>(value.size()), &ZOO_OPEN_ACL_UNSAFE,
+                       flags, CompleteString, context);
+      break;
+    case OperationKind::kExists:
+      rc = zoo_aexists(session->handle, path.c_str(), 0, CompleteStat, context);
+      break;
+    case OperationKind::kWatchExists:
+      rc = zoo_awexists(session->handle, path.c_str(), GlobalWatcher,
+                        session.get(), CompleteStat, context);
+      break;
+    case OperationKind::kGet:
+      rc = zoo_aget(session->handle, path.c_str(), 0, CompleteData, context);
+      break;
+  }
+  if (rc != ZOK) {
+    // An enqueue failure has no completion callback.
+    delete context;
+    operation->rc = rc;
+    operation->done = true;
+  }
+  std::unique_lock<std::mutex> lock(signal_->mutex);
+  const bool finished = signal_->cv.wait_until(lock, deadline, [&] {
+    return operation->done || signal_->stopped.load();
+  });
+  const bool uncertain =
+      !finished || !operation->done || Clock::now() >= deadline ||
+      operation->rc == ZCONNECTIONLOSS || operation->rc == ZOPERATIONTIMEOUT;
+  if (uncertain || signal_->stopped.load()) {
+    lock.unlock();
+    // Timeout cannot cancel a create. Retire the whole session in recovery,
+    // clearing any uncommitted ephemeral nodes without blocking this caller.
+    session->Retire();
+    return nullptr;
+  }
+  return operation;
+}
 
 // 条件变量控制限时取得注册所有权；ZooKeeper 调用期间不持有该互斥量。
 struct ServiceRegistry::Registration {
@@ -157,8 +264,10 @@ bool ServiceRegistry::EnsurePath(const std::shared_ptr<Session>& session,
     return false;
   while (Clock::now() < deadline && session->Connected() &&
          !signal_->stopped.load()) {
-    int rc = zoo_create(session->handle, path.c_str(), "", 0,
-                        &ZOO_OPEN_ACL_UNSAFE, 0, nullptr, 0);
+    auto result =
+        Execute(session, OperationKind::kCreate, path, "", 0, deadline);
+    if (!result) return false;
+    int rc = result->rc;
     if (rc == ZOK) return true;
     if (rc == ZNONODE && separator > 0) {
       if (!EnsurePath(session, path.substr(0, separator), deadline))
@@ -167,7 +276,10 @@ bool ServiceRegistry::EnsurePath(const std::shared_ptr<Session>& session,
     }
     if (rc != ZNODEEXISTS) return false;
     Stat stat{};
-    rc = zoo_exists(session->handle, path.c_str(), 0, &stat);
+    result = Execute(session, OperationKind::kExists, path, "", 0, deadline);
+    if (!result) return false;
+    rc = result->rc;
+    stat = result->stat;
     if (rc == ZNONODE) continue;
     if (rc == ZOK && stat.ephemeralOwner == 0) return true;
     LOG_ERROR("Registry parent path is not persistent: {}", path);
@@ -185,9 +297,10 @@ bool ServiceRegistry::RegisterOnSession(const std::shared_ptr<Session>& session,
   const std::string path = parent + "/" + address;
   while (Clock::now() < deadline && session->Connected() &&
          !signal_->stopped.load()) {
-    int rc = zoo_create(session->handle, path.c_str(), address.data(),
-                        static_cast<int>(address.size()), &ZOO_OPEN_ACL_UNSAFE,
-                        ZOO_EPHEMERAL, nullptr, 0);
+    auto result = Execute(session, OperationKind::kCreate, path, address,
+                          ZOO_EPHEMERAL, deadline);
+    if (!result) return false;
+    int rc = result->rc;
     if (rc == ZOK) return true;
     if (rc == ZNONODE) {
       if (!EnsurePath(session, parent, deadline)) return false;
@@ -202,8 +315,11 @@ bool ServiceRegistry::RegisterOnSession(const std::shared_ptr<Session>& session,
     }
     Stat stat{};
     // 使用稳定的 Session 上下文，期限结束后遗留的 watch 也不会访问栈内存。
-    rc = zoo_wexists(session->handle, path.c_str(), GlobalWatcher,
-                     session.get(), &stat);
+    result =
+        Execute(session, OperationKind::kWatchExists, path, "", 0, deadline);
+    if (!result) return false;
+    rc = result->rc;
+    stat = result->stat;
     if (rc == ZNONODE) continue;
     if (rc != ZOK) return false;
     if (stat.ephemeralOwner == 0) {
@@ -213,17 +329,18 @@ bool ServiceRegistry::RegisterOnSession(const std::shared_ptr<Session>& session,
     const clientid_t* id = zoo_client_id(session->handle);
     if (!id || id->client_id == 0) return false;
     if (stat.ephemeralOwner == id->client_id) {
-      std::vector<char> data(address.size() + 1);
-      int length = static_cast<int>(data.size());
-      rc = zoo_get(session->handle, path.c_str(), 0, data.data(), &length,
-                   &stat);
+      result = Execute(session, OperationKind::kGet, path, "", 0, deadline);
+      if (!result) return false;
+      rc = result->rc;
+      stat = result->stat;
       if (rc == ZNONODE) continue;
       if (rc != ZOK) return false;
       // get 返回的 Stat 再次验证所有权，覆盖 exists/get 之间的节点重建竞争。
       if (stat.ephemeralOwner == id->client_id) {
         return stat.dataLength == static_cast<int>(address.size()) &&
-               length == static_cast<int>(address.size()) &&
-               std::memcmp(data.data(), address.data(), address.size()) == 0;
+               result->length == static_cast<int>(address.size()) &&
+               std::memcmp(result->data.data(), address.data(),
+                           address.size()) == 0;
       }
       if (stat.ephemeralOwner == 0) return false;
     }
@@ -249,11 +366,23 @@ bool ServiceRegistry::RegisterService(const std::string& name,
   Registration registration(*this, deadline);
   if (!registration.acquired) return false;
   const auto session = Snapshot();
-  if (!session || !session->Connected() ||
-      !RegisterOnSession(session, name, address, deadline))
-    return false;
-  registrations_[name + "/" + address] = {name, address};
-  return true;
+  if (!session || !session->Connected()) return false;
+  // Allocate the recovery entry before issuing any create. Failed attempts are
+  // removed, so only confirmed registrations are replayed by recovery.
+  const std::string key = name + "/" + address;
+  bool inserted = false;
+  try {
+    inserted = registrations_.try_emplace(key, name, address).second;
+    if (RegisterOnSession(session, name, address, deadline)) {
+      if (Clock::now() < deadline) return true;
+      session->Retire();
+    }
+  } catch (const std::exception& error) {
+    session->Retire();
+    LOG_ERROR("Failed to register service: {}", error.what());
+  }
+  if (inserted) registrations_.erase(key);
+  return false;
 }
 
 void ServiceRegistry::Recover() {
@@ -276,10 +405,26 @@ void ServiceRegistry::Recover() {
       // 旧会话的最后一个快照在注册锁释放后才关闭。
       auto session = Snapshot();
       std::shared_ptr<Session> retired;
+      {
+        Registration registration(*this, Clock::time_point::max());
+        if (!registration.acquired || signal_->stopped.load()) break;
+        session = Snapshot();
+        if (session && session->Terminal()) {
+          {
+            std::lock_guard<std::mutex> session_lock(session_mutex_);
+            retired = std::move(session_);
+          }
+          session.reset();
+          needs_restore_ = true;
+        }
+      }
+      // Closing is outside registration/watch locks, and precedes replay:
+      // a retired (but unexpired) session may still own the instance paths.
+      retired.reset();
       Registration registration(*this, Clock::time_point::max());
-      if (!registration.acquired) break;
-      if (signal_->stopped.load()) break;
-      if (session && session->Terminal()) {
+      if (!registration.acquired || signal_->stopped.load()) break;
+      session = Snapshot();
+      if (!session) {
         auto replacement = CreateSession();
         if (!replacement) {
           retry = true;
@@ -287,13 +432,11 @@ void ServiceRegistry::Recover() {
         }
         {
           std::lock_guard<std::mutex> session_lock(session_mutex_);
-          session_.swap(replacement);
+          session_ = replacement;
         }
-        retired = std::move(replacement);
-        session = Snapshot();
-        needs_restore_ = true;
+        session = std::move(replacement);
       }
-      retry = !session || !session->Connected();
+      retry = !session->Connected();
       if (retry || !needs_restore_) continue;
       needs_restore_ = false;
       for (const auto& registration : registrations_) {

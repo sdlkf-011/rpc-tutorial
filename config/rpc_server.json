@@ -2,7 +2,8 @@
   "servers_name_prefix": "cookrpc",
   "servers_ip": "0.0.0.0",
   "servers_port": 8989,
-  "max_connections": 800000,
+  "max_connections": 10000,
+  "listen_backlog": 1024,
   "timeout": 5000,
   "scheduler": {
     "zk_namespace": "/cookrpc",

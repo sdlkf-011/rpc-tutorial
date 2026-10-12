@@ -134,3 +134,49 @@ TEST(ZstdCompressTest, CompressBoundCanHoldCompressedOutput) {
 
 }  // namespace
 }  // namespace cookrpc
+
+TEST(ZstdDecompressionLimits, RejectsHugeDeclaredLengthBeforeAllocating) {
+  std::string frame("\x28\xb5\x2f\xfd\xe0", 5);
+  const uint64_t size = uint64_t{1} << 40;
+  for (int i = 0; i < 8; ++i)
+    frame.push_back(static_cast<char>(size >> (8 * i)));
+  frame.append("\1\0\0", 3);
+  std::string output = "stale";
+  bool ok = true;
+  EXPECT_NO_THROW(ok = cookrpc::ZstdCompress::GetInstance().DecompressString(
+                      frame, output));
+  EXPECT_FALSE(ok);
+  EXPECT_TRUE(output.empty());
+}
+
+TEST(ZstdDecompressionLimits, AcceptsBoundaryAndRejectsOversizedOutput) {
+  auto& codec = cookrpc::ZstdCompress::GetInstance();
+  std::string compressed, output;
+  ASSERT_TRUE(codec.CompressString(std::string(1024 * 1024, 'x'), compressed));
+  ASSERT_TRUE(codec.DecompressString(compressed, output));
+  EXPECT_EQ(output.size(), 1024 * 1024u);
+  ASSERT_TRUE(
+      codec.CompressString(std::string(1024 * 1024 + 1, 'x'), compressed));
+  EXPECT_FALSE(codec.DecompressString(compressed, output));
+  EXPECT_TRUE(output.empty());
+  std::vector<char> binary;
+  EXPECT_FALSE(
+      codec.DecompressData(compressed.data(), compressed.size(), binary));
+  EXPECT_TRUE(binary.empty());
+}
+
+TEST(ZstdDecompressionLimits, CallerCanChooseABoundedOutputLimit) {
+  auto& codec = cookrpc::ZstdCompress::GetInstance();
+  std::string compressed, output;
+  ASSERT_TRUE(codec.CompressString(std::string(256, 'x'), compressed));
+  EXPECT_FALSE(codec.DecompressString(compressed, output, 255));
+  EXPECT_TRUE(output.empty());
+  ASSERT_TRUE(codec.DecompressString(compressed, output, 256));
+  EXPECT_EQ(output.size(), 256u);
+  std::vector<char> binary;
+  EXPECT_FALSE(
+      codec.DecompressData(compressed.data(), compressed.size(), binary, 255));
+  ASSERT_TRUE(
+      codec.DecompressData(compressed.data(), compressed.size(), binary, 256));
+  EXPECT_EQ(binary.size(), 256u);
+}

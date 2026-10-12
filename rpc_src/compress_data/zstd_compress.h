@@ -21,6 +21,7 @@ enum class Level {
 // Zstandard 压缩封装类
 class ZstdCompress {
  public:
+  static constexpr size_t kDefaultMaxOutputSize = 1024 * 1024;
   static ZstdCompress& GetInstance() {
     static ZstdCompress instance;
     return instance;
@@ -30,15 +31,17 @@ class ZstdCompress {
   bool CompressString(const std::string& src, std::string& dst,
                       Level level = Level::kDefault);
 
-  // 解压字符串
-  bool DecompressString(const std::string& src, std::string& dst);
+  // 分配前检查输出上限；解压失败（包括分配异常）清空 dst 并返回 false。
+  bool DecompressString(const std::string& src, std::string& dst,
+                        size_t max_output_size = kDefaultMaxOutputSize);
 
   // 压缩二进制数据
   bool CompressData(const char* src, size_t src_len, std::vector<char>& dst,
                     Level level = Level::kDefault);
 
   // 解压二进制数据
-  bool DecompressData(const char* src, size_t src_len, std::vector<char>& dst);
+  bool DecompressData(const char* src, size_t src_len, std::vector<char>& dst,
+                      size_t max_output_size = kDefaultMaxOutputSize);
 
   // 获取压缩后的最大可能大小
   size_t GetCompressBound(size_t src_size) const {

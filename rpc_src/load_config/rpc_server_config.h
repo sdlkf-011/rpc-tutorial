@@ -47,6 +47,7 @@ class RpcServerConfig {
   uint32_t GetTimeout() const { return timeout_; }
 
   uint32_t GetMaxConnections() const { return max_connections_; }
+  uint32_t GetListenBacklog() const { return listen_backlog_; }
 
   // 获取子配置
   const ServiceRegistryConfig* GetServiceRegistryConfig() const {
@@ -65,6 +66,7 @@ class RpcServerConfig {
  private:
   // 基础配置
   uint32_t max_connections_ = 0;
+  uint32_t listen_backlog_ = 1024;
   std::string servers_ip_;
   uint16_t servers_port_ = 0;
   uint32_t timeout_ = 0;

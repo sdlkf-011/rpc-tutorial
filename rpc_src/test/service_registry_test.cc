@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -41,6 +42,18 @@ std::unordered_map<std::string, std::vector<Watch>> watches;
 bool vanish_before_watch = false;
 bool replace_during_get = false;
 size_t watch_count = 0;
+struct Pending {
+  Handle* handle;
+  std::function<void(int)> complete;
+};
+std::vector<Pending> pending_operations;
+bool defer_create = false;
+bool defer_get = false;
+size_t canceled_completions = 0;
+bool hold_close = false;
+bool close_entered = false;
+bool release_close = false;
+bool reject_connections = false;
 
 Handle* Cast(zhandle_t* handle) { return reinterpret_cast<Handle*>(handle); }
 zhandle_t* Cast(Handle* handle) { return reinterpret_cast<zhandle_t*>(handle); }
@@ -118,6 +131,10 @@ bool WaitForWatch(size_t count = 1) {
 extern "C" {
 zhandle_t* __wrap_zookeeper_init(const char*, watcher_fn watcher, int,
                                  const clientid_t*, void* context, int) {
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (reject_connections) return nullptr;
+  }
   auto handle = std::make_unique<Handle>();
   handle->watcher = watcher;
   handle->context = context;
@@ -134,10 +151,26 @@ zhandle_t* __wrap_zookeeper_init(const char*, watcher_fn watcher, int,
 int __wrap_zookeeper_close(zhandle_t* value) {
   auto* handle = Cast(value);
   std::vector<Watch> pending;
+  std::vector<Pending> canceled;
   {
     std::unique_lock<std::mutex> lock(mutex);
     EXPECT_FALSE(handle->closed);
+    if (hold_close) {
+      close_entered = true;
+      cv.notify_all();
+      cv.wait(lock, [] { return release_close; });
+    }
     handle->closed = true;
+    for (auto it = pending_operations.begin();
+         it != pending_operations.end();) {
+      if (it->handle == handle) {
+        canceled.push_back(std::move(*it));
+        it = pending_operations.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    canceled_completions += canceled.size();
     cv.wait(lock, [&] { return handle->callbacks == 0; });
     std::vector<std::string> paths;
     for (const auto& node : nodes)
@@ -148,8 +181,10 @@ int __wrap_zookeeper_close(zhandle_t* value) {
       pending.insert(pending.end(), events.begin(), events.end());
     }
   }
+  for (auto& operation : canceled) operation.complete(ZCLOSING);
   for (auto watch : pending)
     Emit(watch, ZOO_DELETED_EVENT, ZOO_CONNECTED_STATE);
+  cv.notify_all();
   return ZOK;
 }
 const clientid_t* __wrap_zoo_client_id(zhandle_t* handle) {
@@ -164,6 +199,7 @@ int __wrap_zoo_create(zhandle_t* value, const char* path, const char* data,
   if (nodes.count(path)) return ZNODEEXISTS;
   nodes[path] = {flags & ZOO_EPHEMERAL ? handle->id.client_id : 0,
                  std::string(data, length)};
+  cv.notify_all();
   return ZOK;
 }
 
@@ -216,6 +252,63 @@ int __wrap_zoo_get(zhandle_t*, const char* path, int, char* buffer, int* length,
     Emit(watch, ZOO_DELETED_EVENT, ZOO_CONNECTED_STATE);
   return ZOK;
 }
+int __wrap_zoo_acreate(zhandle_t* handle, const char* path, const char* data,
+                       int length, const ACL_vector* acl, int flags,
+                       string_completion_t complete, const void* context) {
+  const int rc =
+      __wrap_zoo_create(handle, path, data, length, acl, flags, nullptr, 0);
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if ((flags & ZOO_EPHEMERAL) && defer_create) {
+      defer_create = false;
+      pending_operations.push_back(
+          {Cast(handle), [complete, context](int result) {
+             complete(result, nullptr, context);
+           }});
+      cv.notify_all();
+      return ZOK;
+    }
+  }
+  complete(rc, path, context);
+  return ZOK;
+}
+int __wrap_zoo_aexists(zhandle_t* handle, const char* path, int watch,
+                       stat_completion_t complete, const void* context) {
+  Stat stat{};
+  const int rc = __wrap_zoo_exists(handle, path, watch, &stat);
+  complete(rc, &stat, context);
+  return ZOK;
+}
+int __wrap_zoo_awexists(zhandle_t* handle, const char* path, watcher_fn watcher,
+                        void* watcher_context, stat_completion_t complete,
+                        const void* context) {
+  Stat stat{};
+  const int rc =
+      __wrap_zoo_wexists(handle, path, watcher, watcher_context, &stat);
+  complete(rc, &stat, context);
+  return ZOK;
+}
+int __wrap_zoo_aget(zhandle_t* handle, const char* path, int watch,
+                    data_completion_t complete, const void* context) {
+  char data[2048];
+  int length = sizeof(data);
+  Stat stat{};
+  const int rc = __wrap_zoo_get(handle, path, watch, data, &length, &stat);
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (defer_get) {
+      defer_get = false;
+      pending_operations.push_back(
+          {Cast(handle), [complete, context](int result) {
+             complete(result, nullptr, 0, nullptr, context);
+           }});
+      cv.notify_all();
+      return ZOK;
+    }
+  }
+  complete(rc, data, length, &stat, context);
+  return ZOK;
+}
 }
 
 namespace cookrpc {
@@ -229,10 +322,15 @@ class RegistryTest : public testing::Test {
     watches.clear();
     vanish_before_watch = replace_during_get = false;
     watch_count = 0;
+    defer_create = defer_get = false;
+    pending_operations.clear();
+    canceled_completions = 0;
+    hold_close = close_entered = release_close = reject_connections = false;
   }
   void TearDown() override {
     std::lock_guard<std::mutex> lock(mutex);
     for (const auto& handle : handles) EXPECT_TRUE(handle->closed);
+    EXPECT_TRUE(pending_operations.empty());
   }
 };
 
@@ -385,5 +483,105 @@ TEST_F(RegistryTest, RegistrationDeadlineIncludesWaitingForAnotherRegistrar) {
   Delete(path);
   EXPECT_TRUE(blocked.get());
 }
+TEST_F(RegistryTest,
+       CreateDeadlineRetiresUnknownOutcomeAndRestoresOnlyCommittedNodes) {
+  ServiceRegistry registry("fake");
+  ASSERT_TRUE(registry.RegisterService("service", "127.0.0.1:8000"));
+  const auto old_owner = SnapshotNode().owner;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    defer_create = true;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE(registry.RegisterService("service", "127.0.0.1:8001", 40ms));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 300ms);
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(cv.wait_for(lock, 2s, [&] {
+      return canceled_completions == 1 && nodes.count(path) &&
+             nodes.at(path).owner != old_owner &&
+             !nodes.count("/cookrpc/service/127.0.0.1:8001");
+    }));
+  }
+  EXPECT_TRUE(registry.RegisterService("service", "127.0.0.1:8001"));
+}
+
+TEST_F(RegistryTest, ReconnectFailureStillClosesTheUncertainSession) {
+  ServiceRegistry registry("fake");
+  Handle* old;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    old = handles.front().get();
+    defer_create = reject_connections = true;
+  }
+  EXPECT_FALSE(registry.RegisterService("service", "127.0.0.1:8000", 40ms));
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(cv.wait_for(lock, 2s,
+                            [&] { return old->closed && !nodes.count(path); }));
+    reject_connections = false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!registry.IsConnected() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  EXPECT_TRUE(registry.IsConnected());
+  EXPECT_TRUE(registry.RegisterService("service", "127.0.0.1:8000"));
+}
+
+TEST_F(RegistryTest, LateSuccessfulCreateCannotBecomeAConfirmedRegistration) {
+  ServiceRegistry registry("fake");
+  ASSERT_TRUE(registry.RegisterService("service", "127.0.0.1:8000"));
+  const auto old_owner = SnapshotNode().owner;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    defer_create = hold_close = true;
+  }
+  EXPECT_FALSE(registry.RegisterService("service", "127.0.0.1:8001", 40ms));
+  std::function<void(int)> complete;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(cv.wait_for(lock, 2s, [] { return close_entered; }));
+    if (!pending_operations.empty()) {
+      complete = std::move(pending_operations.front().complete);
+      pending_operations.erase(pending_operations.begin());
+    }
+  }
+  if (complete) complete(ZOK);  // SDK reports success after the public timeout.
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release_close = true;
+    hold_close = false;
+  }
+  cv.notify_all();
+  EXPECT_TRUE(static_cast<bool>(complete));
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(cv.wait_for(lock, 2s, [&] {
+      return nodes.count(path) && nodes.at(path).owner != old_owner &&
+             !nodes.count("/cookrpc/service/127.0.0.1:8001");
+    }));
+  }
+  ASSERT_TRUE(registry.RegisterService("service", "127.0.0.1:8001"));
+  const auto owner = SnapshotNode().owner;
+  EXPECT_NE(owner, old_owner);
+}
+
+TEST_F(RegistryTest,
+       ReadDeadlineAndPendingCallbackRemainSafeDuringDestruction) {
+  auto registry = std::make_unique<ServiceRegistry>("fake");
+  ASSERT_TRUE(registry->RegisterService("service", "127.0.0.1:8000"));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    defer_get = true;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE(registry->RegisterService("service", "127.0.0.1:8000", 40ms));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 300ms);
+  registry.reset();
+  std::lock_guard<std::mutex> lock(mutex);
+  EXPECT_EQ(canceled_completions, 1u);
+  EXPECT_TRUE(pending_operations.empty());
+}
+
 }  // namespace
 }  // namespace cookrpc

@@ -219,6 +219,26 @@ int main(int argc, char** argv) {
         Require(std::chrono::steady_clock::now() - start < 500ms,
                 "slow reader blocked fast connection");
         Report("tcp");
+      } else if (command == "registration-deadline") {
+        const auto start = std::chrono::steady_clock::now();
+        Require(!registry->RegisterService(name, "127.0.0.1:1", 50ms),
+                "stalled registration reported success");
+        Require(std::chrono::steady_clock::now() - start < 500ms,
+                "registration exceeded deadline under a stalled transport");
+        Report(command);
+      } else if (command == "deadline-recovered") {
+        Await(
+            [&] {
+              return registry->IsConnected() &&
+                     observer.Exists(path, stat) == ZOK &&
+                     stat.ephemeralOwner != owner;
+            },
+            "registration did not recover after deadline retirement");
+        owner = stat.ephemeralOwner;
+        Require(observer.Exists(space + "/127.0.0.1:1", stat) == ZNONODE,
+                "timed-out registration left a discoverable instance");
+        echo();
+        Report(command, owner);
       } else if (command == "absent") {
         Await([&] { return observer.Exists(path, stat) == ZNONODE; },
               "isolated session did not expire");
