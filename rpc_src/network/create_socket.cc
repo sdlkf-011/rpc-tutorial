@@ -45,7 +45,7 @@ std::shared_ptr<CreateSocket> CreateSocket::Create(
 
 std::shared_ptr<CreateSocket> CreateSocket::Create(
     const RpcServerConfig& config) {
-  if (config.GetMaxConnections() >
+  if (config.GetListenBacklog() >
           static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
       config.GetTimeout() >
           static_cast<uint32_t>(std::numeric_limits<int>::max())) {
@@ -54,7 +54,7 @@ std::shared_ptr<CreateSocket> CreateSocket::Create(
   }
 
   return Create(config.GetServersNameProfix(), config.GetServersPort(),
-                static_cast<int>(config.GetMaxConnections()),
+                static_cast<int>(config.GetListenBacklog()),
                 static_cast<int>(config.GetTimeout()), config.GetServersIp());
 }
 
@@ -72,10 +72,10 @@ CreateSocket::CreateSocket(const std::string& servers_name_prefix,
 CreateSocket::CreateSocket(const RpcServerConfig& config)
     : CreateSocket(
           config.GetServersNameProfix(), config.GetServersPort(),
-          config.GetMaxConnections() >
+          config.GetListenBacklog() >
                   static_cast<uint32_t>(std::numeric_limits<int>::max())
               ? -1
-              : static_cast<int>(config.GetMaxConnections()),
+              : static_cast<int>(config.GetListenBacklog()),
           config.GetTimeout() >
                   static_cast<uint32_t>(std::numeric_limits<int>::max())
               ? -1

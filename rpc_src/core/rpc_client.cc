@@ -20,6 +20,7 @@
 #include <thread>
 #include <utility>
 
+#include "config_validation.h"
 #include "load_balancer.h"
 #include "zk_conn_handler.h"
 
@@ -65,11 +66,15 @@ bool RpcClient::LoadConfig(const std::string& config_path) {
 
     const nlohmann::json config = nlohmann::json::parse(config_file);
     const std::string zk_host = config.value("zk_host", "localhost");
-    const int zk_port = config.value("zk_port", 2181);
+    const int zk_port =
+        config_validation::ReadInteger(config, "zk_port", 2181, 1, 65535);
     std::string zk_namespace = config.value("zk_namespace", "/cookrpc");
-    const int timeout_ms = config.value("timeout_ms", 3000);
-    const int retry_times = config.value("retry_times", 3);
-    const int server_port = config.value("server_port", 8989);
+    const int timeout_ms = config_validation::ReadInteger(config, "timeout_ms",
+                                                          3000, 1, INT32_MAX);
+    const int retry_times =
+        config_validation::ReadInteger(config, "retry_times", 3, 0, 100);
+    const int server_port =
+        config_validation::ReadInteger(config, "server_port", 8989, 1, 65535);
     const std::string load_balance_strategy =
         config.value("load_balance_strategy", "random");
 
@@ -319,10 +324,21 @@ bool RpcClient::WaitForConnection(int fd, int attempt) const {
   descriptor.fd = fd;
   descriptor.events = POLLOUT;
 
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms_);
   int poll_result = 0;
   // EINTR 只表示被信号打断，重试等待；其他错误直接结束本次连接尝试。
   do {
-    poll_result = poll(&descriptor, 1, timeout_ms_);
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      poll_result = 0;
+      break;
+    }
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    poll_result =
+        poll(&descriptor, 1,
+             static_cast<int>(std::max<int64_t>(1, remaining.count())));
   } while (poll_result < 0 && errno == EINTR);
 
   if (poll_result == 0) {

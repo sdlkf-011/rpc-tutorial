@@ -299,6 +299,11 @@ if(BUILD_TESTING)
   enable_project_warnings(rpc_client_config_test)
   gtest_discover_tests(rpc_client_config_test)
 
+  add_executable(server_config_test rpc_src/test/server_config_test.cc)
+  target_link_libraries(server_config_test PRIVATE rpc_common GTest::gtest_main)
+  enable_project_warnings(server_config_test)
+  gtest_discover_tests(server_config_test)
+
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
   add_test(NAME scripts_regression
     COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/rpc_src/test/scripts_test.py")
@@ -321,7 +326,8 @@ if(BUILD_TESTING)
     target_link_options(network_test PRIVATE
       "-Wl,--wrap=zookeeper_init" "-Wl,--wrap=zookeeper_close"
       "-Wl,--wrap=zoo_get_children" "-Wl,--wrap=zoo_get"
-      "-Wl,--wrap=deallocate_String_vector")
+      "-Wl,--wrap=deallocate_String_vector" "-Wl,--wrap=poll"
+      "-Wl,--wrap=accept" "-Wl,--wrap=epoll_wait")
     enable_project_warnings(network_test)
     gtest_discover_tests(network_test PROPERTIES TIMEOUT 30)
 
@@ -330,7 +336,9 @@ if(BUILD_TESTING)
     target_link_options(service_registry_test PRIVATE
       "-Wl,--wrap=zookeeper_init" "-Wl,--wrap=zookeeper_close"
       "-Wl,--wrap=zoo_exists" "-Wl,--wrap=zoo_wexists"
-      "-Wl,--wrap=zoo_get" "-Wl,--wrap=zoo_create" "-Wl,--wrap=zoo_client_id")
+      "-Wl,--wrap=zoo_get" "-Wl,--wrap=zoo_create" "-Wl,--wrap=zoo_client_id"
+      "-Wl,--wrap=zoo_acreate" "-Wl,--wrap=zoo_aexists"
+      "-Wl,--wrap=zoo_awexists" "-Wl,--wrap=zoo_aget")
     enable_project_warnings(service_registry_test)
     gtest_discover_tests(service_registry_test PROPERTIES TIMEOUT 30)
 

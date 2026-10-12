@@ -25,7 +25,8 @@ class Proxy:
         self.socket.settimeout(.1)
         self.port = self.socket.getsockname()[1]
         self.condition = threading.Condition()
-        self.paused = self.stopped = False
+        self.paused = self.stopped = self.blocked = False
+        self.parked = 0
         self.connections = set()
         self.workers = []
         self.acceptor = threading.Thread(target=self.accept)
@@ -52,6 +53,12 @@ class Proxy:
             pending = {client: bytearray(), upstream: bytearray()}
             peers = {client: upstream, upstream: client}
             while not self.stopped:
+                with self.condition:
+                    if self.blocked:
+                        self.parked += 1; self.condition.notify_all()
+                        self.condition.wait_for(lambda: not self.blocked or self.stopped)
+                        self.parked -= 1
+                    if self.stopped: return
                 readable, writable, _ = select.select([client, upstream],
                     [sock for sock, data in pending.items() if data], [], .1)
                 for sock in readable:
@@ -71,6 +78,16 @@ class Proxy:
                 if upstream: self.connections.discard(upstream)
             client.close()
             if upstream: upstream.close()
+
+    def stall(self):
+        with self.condition:
+            self.blocked = True
+            if not self.condition.wait_for(lambda: self.parked > 0, timeout=2):
+                raise RuntimeError('registry proxy did not stall')
+
+    def unstall(self):
+        with self.condition:
+            self.blocked = False; self.condition.notify_all()
 
     def pause(self):
         with self.condition:
@@ -163,6 +180,8 @@ def main():
             return record
         initial = expect('ready', False)
         expect('tcp')
+        proxy.stall(); expect('registration-deadline')
+        proxy.unstall(); initial = expect('deadline-recovered')
         proxy.pause(); expect('absent')
         proxy.resume(); recovered = expect('recovered')
         if recovered['owner'] == initial['owner']: raise RuntimeError('expired session owner did not change')

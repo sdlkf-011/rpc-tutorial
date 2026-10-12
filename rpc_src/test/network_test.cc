@@ -1,10 +1,12 @@
 #include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <zookeeper/zookeeper.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -26,12 +28,47 @@
 namespace {
 using namespace std::chrono_literals;
 std::atomic<int> discovered_port{0};
+std::atomic<bool> monitor_accepts{false};
+std::atomic<size_t> accept_batch{0}, largest_accept_batch{0};
+thread_local bool interrupt_connect_poll = false;
+thread_local int connect_interrupts = 0;
+thread_local std::vector<int> connect_poll_timeouts;
 struct FakeZk {
   watcher_fn watcher;
   void* context;
 };
 }  // namespace
 extern "C" {
+int __real_accept(int, sockaddr*, socklen_t*);
+int __wrap_accept(int fd, sockaddr* address, socklen_t* length) {
+  const int accepted = __real_accept(fd, address, length);
+  if (accepted >= 0 && monitor_accepts.load()) ++accept_batch;
+  return accepted;
+}
+int __real_epoll_wait(int, epoll_event*, int, int);
+int __wrap_epoll_wait(int fd, epoll_event* events, int count, int timeout) {
+  if (monitor_accepts.load()) {
+    const auto batch = accept_batch.exchange(0);
+    auto largest = largest_accept_batch.load();
+    while (batch > largest &&
+           !largest_accept_batch.compare_exchange_weak(largest, batch)) {
+    }
+  }
+  return __real_epoll_wait(fd, events, count, timeout);
+}
+int __real_poll(pollfd*, nfds_t, int);
+int __wrap_poll(pollfd* fds, nfds_t count, int timeout) {
+  if (interrupt_connect_poll && count == 1 && fds[0].events == POLLOUT) {
+    connect_poll_timeouts.push_back(timeout);
+    if (connect_interrupts++ < 3) {
+      std::this_thread::sleep_for(10ms);
+      errno = EINTR;
+      return -1;
+    }
+    return 0;
+  }
+  return __real_poll(fds, count, timeout);
+}
 zhandle_t* __wrap_zookeeper_init(const char*, watcher_fn fn, int,
                                  const clientid_t*, void* context, int) {
   auto* handle = new FakeZk{fn, context};
@@ -82,7 +119,7 @@ struct Fd {
 struct Listener {
   Fd fd{socket(AF_INET, SOCK_STREAM, 0)};
   uint16_t port = 0;
-  Listener() {
+  explicit Listener(int backlog = 32) {
     if (fd.value < 0) throw std::runtime_error("socket failed");
     const int small = 4096;
     setsockopt(fd.value, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
@@ -91,7 +128,7 @@ struct Listener {
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(fd.value, reinterpret_cast<sockaddr*>(&address),
              sizeof(address)) != 0 ||
-        listen(fd.value, 32) != 0)
+        listen(fd.value, backlog) != 0)
       throw std::runtime_error("listen failed");
     socklen_t length = sizeof(address);
     getsockname(fd.value, reinterpret_cast<sockaddr*>(&address), &length);
@@ -204,11 +241,12 @@ class NetworkTest : public testing::Test {
   Listener listener;
   std::unique_ptr<MessageCycle> cycle;
   std::thread loop;
+  size_t connection_limit = 10000;
   void SetUp() override {
     TestService();
     meeting_ctrl::ThreadPoolSingleton::Destroy();
     ASSERT_TRUE(meeting_ctrl::ThreadPoolSingleton::Init(1));
-    cycle = std::make_unique<MessageCycle>(nullptr);
+    cycle = std::make_unique<MessageCycle>(nullptr, connection_limit);
     ASSERT_TRUE(cycle->AddListenFd(listener.fd.value));
     loop = std::thread([this] { cycle->Loop(); });
   }
@@ -225,6 +263,60 @@ class NetworkTest : public testing::Test {
     EXPECT_EQ(ConnectionManager::GetInstance().GetConnectionCount(), 0u);
   }
 };
+
+class ConnectionCapacityTest : public NetworkTest {
+  void SetUp() override {
+    connection_limit = 2;
+    NetworkTest::SetUp();
+  }
+};
+TEST_F(ConnectionCapacityTest,
+       RejectsExcessConnectionsAndReusesReleasedCapacity) {
+  auto first = listener.Client();
+  auto second = listener.Client();
+  ASSERT_TRUE(Eventually([] {
+    return ConnectionManager::GetInstance().GetConnectionCount() == 2;
+  }));
+  auto excess = listener.Client();
+  const auto rejected = excess->ReadWithTimeout(1000);
+  EXPECT_TRUE(rejected.eof || rejected.error);
+  EXPECT_EQ(ConnectionManager::GetInstance().GetConnectionCount(), 2u);
+  ASSERT_TRUE(first->Write(Request("normal", 1)));
+  EXPECT_FALSE(ReadFrame(first).empty());
+  first->Close();
+  ASSERT_TRUE(Eventually([] {
+    return ConnectionManager::GetInstance().GetConnectionCount() == 1;
+  }));
+  auto next = listener.Client();
+  ASSERT_TRUE(next->Write(Request("normal", 2)));
+  EXPECT_FALSE(ReadFrame(next).empty());
+  EXPECT_LE(ConnectionManager::GetInstance().GetConnectionCount(), 2u);
+}
+
+TEST(NetworkAdmissionTest, LargeAcceptBacklogYieldsBetweenBatches) {
+  Listener listener(256);
+  std::vector<std::shared_ptr<Connection>> clients;
+  for (int i = 0; i < 128; ++i) clients.push_back(listener.Client());
+  MessageCycle cycle(nullptr);
+  ASSERT_TRUE(cycle.AddListenFd(listener.fd.value));
+  accept_batch = largest_accept_batch = 0;
+  monitor_accepts = true;
+  std::thread loop([&] { cycle.Loop(); });
+  struct Cleanup {
+    MessageCycle& cycle;
+    std::thread& loop;
+    ~Cleanup() {
+      monitor_accepts = false;
+      cycle.Stop();
+      loop.join();
+    }
+  } cleanup{cycle, loop};
+  ASSERT_TRUE(Eventually([] {
+    return ConnectionManager::GetInstance().GetConnectionCount() == 128;
+  }));
+  EXPECT_GT(largest_accept_batch.load(), 0u);
+  EXPECT_LT(largest_accept_batch.load(), clients.size());
+}
 
 TEST(ConnectionTest, PollHangupKeepsDataAndReportsEofAlongsideIt) {
   int descriptors[2];
@@ -441,6 +533,36 @@ TEST(RpcClientNetworkTest, CompleteResponseImmediatelyFollowedByCloseSucceeds) {
 }
 TEST(RpcClientNetworkTest, HalfResponseImmediatelyFollowedByCloseFails) {
   ClientWithClosingPeer(true);
+}
+
+struct ConnectWaitTag {
+  using type = bool (RpcClient::*)(int, int) const;
+  friend type ConnectWait(ConnectWaitTag);
+};
+template <class Tag, typename Tag::type Member>
+struct ExposeMember {
+  friend typename Tag::type ConnectWait(Tag) { return Member; }
+};
+template struct ExposeMember<ConnectWaitTag, &RpcClient::WaitForConnection>;
+TEST(RpcClientNetworkTest, ConnectInterruptionsConsumeOneTotalDeadline) {
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("rpc-connect-deadline-" + std::to_string(getpid()) + ".json");
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() { std::filesystem::remove(path); }
+  } cleanup{path};
+  std::ofstream(path) << nlohmann::json{{"timeout_ms", 100}};
+  RpcClient client(path.string());
+  connect_interrupts = 0;
+  connect_poll_timeouts.clear();
+  interrupt_connect_poll = true;
+  const bool connected = (client.*ConnectWait(ConnectWaitTag{}))(-1, 1);
+  interrupt_connect_poll = false;
+  EXPECT_FALSE(connected);
+  ASSERT_EQ(connect_poll_timeouts.size(), 4u);
+  EXPECT_LT(connect_poll_timeouts.back(), connect_poll_timeouts.front() - 15);
+  EXPECT_LE(connect_poll_timeouts.front(), 100);
 }
 
 TEST(ConnectionTest, RawOversizedResponseAlsoBecomesAShortError) {
