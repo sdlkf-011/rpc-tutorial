@@ -14,18 +14,23 @@ class AesEncrypt {
     return instance;
   }
 
-  // 加密数据
-  bool Encrypt(const std::string& data, std::string& ciphertext);
+  // 加密数据；附加认证数据参与标签计算，但不出现在密文载荷中。
+  bool Encrypt(const std::string& data, std::string& ciphertext,
+               const std::string& associated_data = {}) const;
 
-  // 解密数据
-  bool Decrypt(const std::string& encrypted_data, std::string& plaintext);
+  // 解密时必须提供相同的附加认证数据，认证失败会清空明文输出。
+  bool Decrypt(const std::string& encrypted_data, std::string& plaintext,
+               const std::string& associated_data = {}) const;
+
+  // RPC 传输使用显式共享密钥，不使用单例的进程内随机缺省密钥。
+  explicit AesEncrypt(const std::string& key_hex);
+  ~AesEncrypt();
 
   AesEncrypt(const AesEncrypt&) = delete;
   AesEncrypt& operator=(const AesEncrypt&) = delete;
 
  private:
   AesEncrypt();
-  ~AesEncrypt();
 
   // Base64 编解码
   std::string Base64Encode(const std::string& input) const;

@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -88,6 +89,7 @@ struct Server {
   int listener = -1;
   std::unique_ptr<cookrpc::MessageCycle> cycle;
   std::thread loop;
+  cookrpc::TransportOptions transport;
   explicit Server(uint16_t desired = 0) { Start(desired); }
   void Start(uint16_t desired) {
     listener = socket(AF_INET, SOCK_STREAM, 0);
@@ -108,7 +110,7 @@ struct Server {
     port = ntohs(address.sin_port);
     Require(meeting_ctrl::ThreadPoolSingleton::Init(1),
             "thread pool init failed");
-    cycle = std::make_unique<cookrpc::MessageCycle>(nullptr);
+    cycle = std::make_unique<cookrpc::MessageCycle>(nullptr, 10000, transport);
     Require(cycle->AddListenFd(listener), "listen registration failed");
     loop = std::thread([this] { cycle->Loop(); });
   }
@@ -219,6 +221,50 @@ int main(int argc, char** argv) {
         Require(std::chrono::steady_clock::now() - start < 500ms,
                 "slow reader blocked fast connection");
         Report("tcp");
+      } else if (command == "transport") {
+        // 测试密钥仅在本阶段生效，结束或异常退出时恢复原始环境。
+        const char* old = std::getenv("COOKRPC_MASTER_KEY_HEX");
+        const bool had_key = old != nullptr;
+        const std::string previous_key = old ? old : "";
+        struct RestoreKey {
+          bool had_key;
+          std::string value;
+          ~RestoreKey() {
+            if (had_key)
+              setenv("COOKRPC_MASTER_KEY_HEX", value.c_str(), 1);
+            else
+              unsetenv("COOKRPC_MASTER_KEY_HEX");
+          }
+        } restore_key{had_key, previous_key};
+        setenv("COOKRPC_MASTER_KEY_HEX", std::string(64, '1').c_str(), 1);
+        const auto port = server.port;
+        // 保持注册地址不变，仅重启 TCP 服务来切换传输模式。
+        server.Stop();
+        server.transport = {true, true, 1024};
+        server.Start(port);
+        nlohmann::json secured_config;
+        std::ifstream(config) >> secured_config;
+        secured_config["transport"] = {{"compression", true},
+                                       {"encryption", true}};
+        const auto secured_path = work / "secured-client.json";
+        std::ofstream(secured_path) << secured_config;
+        {
+          auto client =
+              std::make_unique<cookrpc::RpcClient>(secured_path.string());
+          const auto payload = std::string(16000, 'x');
+          auto response = client->AsyncCall<std::string>(
+              name, "Echo", payload, cookrpc::SerializeType::JSON);
+          // 立即释放客户端，任务必须依靠自有会话完成真实加密压缩调用。
+          client.reset();
+          Require(response.get() == payload,
+                  "compressed encrypted asynchronous RPC failed");
+        }
+        server.Stop();
+        // 恢复原始模式，后续会话过期与重启检查继续使用普通请求。
+        server.transport = {};
+        server.Start(port);
+        echo();
+        Report(command);
       } else if (command == "registration-deadline") {
         const auto start = std::chrono::steady_clock::now();
         Require(!registry->RegisterService(name, "127.0.0.1:1", 50ms),

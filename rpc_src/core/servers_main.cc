@@ -151,9 +151,11 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  // 启动时固定传输模式与进程总限流配额，后续连接共享同一份配置。
   cookrpc::MessageCycle message_cycle(
       &cookrpc::ConnectionManager::GetInstance(),
-      server_config.GetMaxConnections());
+      server_config.GetMaxConnections(), server_config.GetTransportOptions(),
+      server_config.GetRateLimitOptions());
   if (!message_cycle.AddListenFd(server_socket->GetFd())) {
     LOG_FATAL("Failed to add server socket to the message cycle");
     meeting_ctrl::ThreadPoolSingleton::Destroy();

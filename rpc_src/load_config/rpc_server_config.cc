@@ -5,6 +5,7 @@
 
 #include "config_validation.h"
 #include "log_manager.h"
+#include "transport_codec.h"
 #include "utils_fun.h"
 
 namespace cookrpc {
@@ -14,8 +15,16 @@ bool RpcServerConfig::InitRpcServerConfig(const std::string& filename) {
     if (!file.is_open()) return false;
     const auto json = nlohmann::json::parse(file);
     using config_validation::ReadInteger;
+
     // 包含所有子配置的候选对象；提交前不改变当前对象或子对象。
     RpcServerConfig candidate;
+    candidate.transport_options_ = TransportOptions::Parse(
+        json.value("transport", nlohmann::json::object()));
+    candidate.rate_limit_options_ = RateLimitOptions::Parse(
+        json.value("rate_limit", nlohmann::json::object()));
+
+    // 提交前验证加密密钥，避免配置已生效却无法建立传输编码器。
+    const TransportCodec validated_transport(candidate.transport_options_);
     candidate.servers_name_prefix_ =
         config_validation::ReadString(json, "servers_name_prefix", "cookrpc");
     candidate.servers_ip_ =
@@ -43,6 +52,8 @@ bool RpcServerConfig::InitRpcServerConfig(const std::string& filename) {
     max_connections_ = candidate.max_connections_;
     listen_backlog_ = candidate.listen_backlog_;
     timeout_ = candidate.timeout_;
+    transport_options_ = candidate.transport_options_;
+    rate_limit_options_ = candidate.rate_limit_options_;
     thread_pool_config_.swap(candidate.thread_pool_config_);
     service_registry_config_.swap(candidate.service_registry_config_);
     return true;

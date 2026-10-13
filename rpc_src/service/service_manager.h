@@ -79,16 +79,23 @@ class ServiceManager {
     return HandleRpcRequestSync(service_name, method_name, args, result);
   }
 
-  // 异步处理 RPC 请求
-  std::future<bool> HandleRpcRequestAsync(const std::string& service_name,
-                                          const std::string& method_name,
-                                          const std::string& args,
-                                          std::string& result) {
-    // 调用方必须保证 result 的生命周期持续到返回的 future 就绪。
+  // 异步结果自有数据，不依赖调用方输出变量的生命周期。
+  struct AsyncResult {
+    bool success = false;
+    std::string data;
+  };
+  std::future<AsyncResult> HandleRpcRequestAsync(
+      const std::string& service_name, const std::string& method_name,
+      const std::string& args) {
+    // 提交前取得服务快照，任务不持有管理器指针，也不捕获外部结果引用。
+    const auto service = GetService(service_name);
     return meeting_ctrl::ThreadPoolSingleton::Enqueue(
         meeting_ctrl::TaskPriority::kNormal,
-        [this, service_name, method_name, args, &result] {
-          return HandleRpcRequestSync(service_name, method_name, args, result);
+        [service, service_name, method_name, args] {
+          AsyncResult result;
+          result.success = HandleServiceSnapshot(
+              service, service_name, method_name, args, result.data);
+          return result;
         });
   }
 
@@ -107,7 +114,16 @@ class ServiceManager {
   bool HandleRpcRequestSync(const std::string& service_name,
                             const std::string& method_name,
                             const std::string& args, std::string& result) {
-    const std::shared_ptr<Service> service = GetService(service_name);
+    return HandleServiceSnapshot(GetService(service_name), service_name,
+                                 method_name, args, result);
+  }
+
+  // 同步与异步入口共用相同的异常处理，不在管理器锁内执行业务。
+  static bool HandleServiceSnapshot(const std::shared_ptr<Service>& service,
+                                    const std::string& service_name,
+                                    const std::string& method_name,
+                                    const std::string& args,
+                                    std::string& result) {
     if (service == nullptr) {
       result.clear();
       LOG_ERROR("Service not found: {}", service_name);

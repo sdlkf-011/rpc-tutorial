@@ -22,16 +22,21 @@ enum class SerializeType {
 // MessageLite 派生类型只允许使用 PROTOBUF，其余类型使用 JSON。
 class SerializerManager {
  public:
+  // 按类型类别检查线格式，不读取业务数据，供调用方在建连和发送前校验。
+  template <typename T>
+  static constexpr bool IsCompatible(SerializeType type) {
+    return IsProtobufMessage<T>() ? type == SerializeType::PROTOBUF
+                                  : type == SerializeType::JSON;
+  }
+
   // 分派序列化操作；类型与格式不匹配时清空 buffer 并返回 false。
   template <typename T>
   static bool Serialize(SerializeType type, const T& data,
                         std::string& buffer) {
-    if constexpr (IsProtobufMessage<T>()) {
-      if (type == SerializeType::PROTOBUF) {
+    if (IsCompatible<T>(type)) {
+      if constexpr (IsProtobufMessage<T>()) {
         return ProtobufSerializer::Serialize(data, buffer);
-      }
-    } else {
-      if (type == SerializeType::JSON) {
+      } else {
         return JsonSerializer::Serialize(data, buffer);
       }
     }
@@ -53,12 +58,10 @@ class SerializerManager {
   template <typename T>
   static bool Deserialize(SerializeType type, const std::string& buffer,
                           T& data) {
-    if constexpr (IsProtobufMessage<T>()) {
-      if (type == SerializeType::PROTOBUF) {
+    if (IsCompatible<T>(type)) {
+      if constexpr (IsProtobufMessage<T>()) {
         return ProtobufSerializer::Deserialize(buffer, data);
-      }
-    } else {
-      if (type == SerializeType::JSON) {
+      } else {
         return JsonSerializer::Deserialize(buffer, data);
       }
     }

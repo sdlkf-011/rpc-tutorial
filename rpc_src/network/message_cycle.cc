@@ -142,8 +142,13 @@ struct MessageCycle::Notifications {
   }
 };
 
-MessageCycle::MessageCycle(ConnectionManager* manager, size_t max_connections)
+MessageCycle::MessageCycle(ConnectionManager* manager, size_t max_connections,
+                           TransportOptions transport,
+                           RateLimitOptions rate_limit)
     : notifications_(std::make_shared<Notifications>()),
+      transport_(std::make_shared<TransportCodec>(
+          transport, TransportCodec::Role::kServer)),
+      limiter_(rate_limit),
       max_connections_(max_connections),
       running_(false),
 #ifdef __APPLE__
@@ -502,11 +507,12 @@ void MessageCycle::HandleNewConnection(int fd) {
     }
 #endif
 
-    auto connection = std::make_shared<Connection>(client_fd);
+    auto connection = std::make_shared<Connection>(client_fd, transport_);
     // 回调捕获 this，析构前必须先 Stop 并清理连接，保证生命周期安全。
-    connection->SetMessageCallback(
-        [this](const std::shared_ptr<Connection>& conn,
-               const RpcRequest& request) { HandleRpcRequest(conn, request); });
+    connection->SetFrameCallback(
+        [this](const std::shared_ptr<Connection>& conn, std::string frame) {
+          HandleRpcFrame(conn, std::move(frame));
+        });
     const auto notifications = notifications_;
     connection->SetEventCallback(
         [notifications](const std::shared_ptr<Connection>& conn) {
@@ -616,6 +622,7 @@ void MessageCycle::RemoveConnection(uint64_t id) {
 #endif
   clients_.erase(found);
   connection->SetMessageCallback(nullptr);
+  connection->SetFrameCallback(nullptr);
   connection->CloseFromEventLoop();
   connection_manager_->RemoveConnection(fd, connection);
 }
@@ -648,8 +655,51 @@ void MessageCycle::HandleRpcRequest(const std::shared_ptr<Connection>& conn,
   HandleRpcRequestAsync(conn, request);
 }
 
+void MessageCycle::HandleRpcFrame(const std::shared_ptr<Connection>& conn,
+                                  std::string frame) {
+  // Connection 已确认头部和完整帧长度，序列号用于回送拒绝响应。
+  uint32_t sequence;
+  std::memcpy(&sequence, frame.data() + 8, sizeof(sequence));
+  sequence = ntohl(sequence);
+  // 入线程池前扣减全局配额，不为超限请求分配解压或业务执行资源。
+  if (!limiter_.TryAcquire()) {
+    SendErrorResponse(conn, sequence, ErrorCode::kRateLimited,
+                      Error::GetErrorMessage(ErrorCode::kRateLimited));
+    return;
+  }
+  conn->BeginRequest();
+  auto task = meeting_ctrl::ThreadPoolSingleton::Enqueue(
+      meeting_ctrl::TaskPriority::kNormal,
+      [conn, codec = transport_, frame = std::move(frame)] {
+        // 任务自有连接、编码器和帧；所有退出路径均归还在途请求计数。
+        struct Done {
+          std::shared_ptr<Connection> conn;
+          ~Done() { conn->FinishRequest(); }
+        } done{conn};
+        std::string plain;
+        RpcRequest request;
+        if (!codec->Decode(frame, plain) || !request.Deserialize(plain)) {
+          // Close 只请求事件线程关闭 fd，工作线程不直接回收套接字。
+          conn->Close();
+          return;
+        }
+        ProcessRpcRequest(conn, request);
+      });
+  if (!task.valid()) {
+    // 任务未被接收，不会运行完成守卫，必须在此撤销在途计数。
+    conn->FinishRequest();
+    SendErrorResponse(conn, sequence, ErrorCode::kServiceUnavailable,
+                      Error::GetErrorMessage(ErrorCode::kServiceUnavailable));
+  }
+}
+
 void MessageCycle::HandleRpcRequestAsync(
     const std::shared_ptr<Connection>& conn, const RpcRequest& request) {
+  if (!limiter_.TryAcquire()) {
+    SendErrorResponse(conn, request.GetSequenceId(), ErrorCode::kRateLimited,
+                      Error::GetErrorMessage(ErrorCode::kRateLimited));
+    return;
+  }
   // 异步请求模块：将业务处理投递线程池，避免事件线程被慢请求阻塞。
   conn->BeginRequest();
   std::future<void> task = meeting_ctrl::ThreadPoolSingleton::Enqueue(

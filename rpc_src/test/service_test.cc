@@ -184,16 +184,19 @@ TEST(ServiceManagerTest, ForwardsAsynchronousRequest) {
   // 单线程足以验证异步分发，并避免测试按机器核心数创建大量工作线程。
   ASSERT_TRUE(meeting_ctrl::ThreadPoolSingleton::Init(1));
   std::string result;
-  std::future<bool> handled = manager.HandleRpcRequestAsync(
-      "AsynchronousService", "AsyncEcho", "async request", result);
+  auto handled = manager.HandleRpcRequestAsync("AsynchronousService",
+                                               "AsyncEcho", "async request");
 
   ASSERT_TRUE(handled.valid());
-  EXPECT_TRUE(handled.get());
+  // 返回结果自身持有字符串，无需保证外部输出引用在任务期间存活。
+  const auto completed = handled.get();
+  EXPECT_TRUE(completed.success);
+  result = completed.data;
   EXPECT_EQ(service->LastMethodName(), "AsyncEcho");
   EXPECT_EQ(service->LastArgs(), "async request");
   EXPECT_EQ(result, "async response");
 
-  // future 完成后再销毁线程池，确保引用传入的 result 已不再被后台访问。
+  // 结果由 future 持有；完成后销毁线程池。
   meeting_ctrl::ThreadPoolSingleton::Destroy();
 }
 

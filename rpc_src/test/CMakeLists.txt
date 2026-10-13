@@ -2,12 +2,14 @@ find_package(GTest REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 include(GoogleTest)
 
+# 仅替换指定符号来注入故障或模拟发现，保留未替换的真实网络实现。
 function(rpc_wrap_symbols target)
     foreach(symbol IN LISTS ARGN)
         target_link_options(${target} PRIVATE "LINKER:--wrap=${symbol}")
     endforeach()
 endfunction()
 
+# 每个测试用例单独注册到 CTest，可按名称筛选并设置独立超时。
 function(rpc_add_gtest target)
     cmake_parse_arguments(TEST "" "TIMEOUT" "SOURCES;WRAP" ${ARGN})
     if(TEST_UNPARSED_ARGUMENTS OR NOT TEST_SOURCES)
@@ -26,6 +28,7 @@ endfunction()
 rpc_add_gtest(load_balancer_test SOURCES load_balancer_test.cc)
 rpc_add_gtest(serializer_test SOURCES serializer_test.cc)
 rpc_add_gtest(rpc_protocol_test SOURCES rpc_protocol_test.cc)
+rpc_add_gtest(transport_controls_test SOURCES transport_controls_test.cc)
 rpc_add_gtest(service_test SOURCES service_test.cc)
 rpc_add_gtest(thread_pool_test SOURCES thread_pool_test.cc TIMEOUT 30)
 rpc_add_gtest(aes_encrypt_test SOURCES aes_encrypt_test.cc)
@@ -38,12 +41,12 @@ add_test(NAME scripts_regression
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts_test.py")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # 只替换 ZooKeeper C API；网络和并发代码仍是生产实现。
+    # 模拟 ZooKeeper 发现；网络系统调用包装仅在注入故障时替换真实行为。
     set(RPC_DISCOVERY_WRAPS
         zookeeper_init zookeeper_close zoo_get_children zoo_get deallocate_String_vector)
 
     rpc_add_gtest(network_test SOURCES network_test.cc TIMEOUT 30
-        WRAP ${RPC_DISCOVERY_WRAPS} poll accept epoll_wait)
+        WRAP ${RPC_DISCOVERY_WRAPS} poll accept epoll_wait socket setsockopt connect)
     rpc_add_gtest(service_registry_test SOURCES service_registry_test.cc TIMEOUT 30
         WRAP zookeeper_init zookeeper_close zoo_exists zoo_wexists zoo_get
             zoo_create zoo_client_id zoo_acreate zoo_aexists zoo_awexists zoo_aget)

@@ -1,8 +1,8 @@
-"""Real ZooKeeper session expiration, restart/discovery and TCP backpressure.
+"""验证真实 ZooKeeper 会话过期、重启发现、TCP 背压和压缩加密调用。
 
-Requires Java plus ZooKeeper jars. Set ZK_SERVER_CLASSPATH for another install.
-A TCP proxy isolates only the registry connection, leaving the server and
-observer alive so the server actually expires the session.
+需要 Java 和 ZooKeeper 服务端 jars，可通过 ZK_SERVER_CLASSPATH 指定安装位置。
+TCP 代理只隔离注册会话，保留 ZooKeeper 服务端和观察者连接，
+使会话过期由真实 ZooKeeper 服务端判断。
 """
 import argparse
 import json
@@ -80,6 +80,7 @@ class Proxy:
             if upstream: upstream.close()
 
     def stall(self):
+        # 保持连接但停止转发，模拟服务端迟迟不返回注册结果。
         with self.condition:
             self.blocked = True
             if not self.condition.wait_for(lambda: self.parked > 0, timeout=2):
@@ -90,6 +91,7 @@ class Proxy:
             self.blocked = False; self.condition.notify_all()
 
     def pause(self):
+        # 切断已有连接并阻止重连，使注册会话真正超时过期。
         with self.condition:
             self.paused = True
             for sock in list(self.connections):
@@ -111,6 +113,7 @@ class Proxy:
         for worker in self.workers: worker.join()
 
 class ZooKeeper:
+    """在独立数据目录和本地随机端口启动 ZooKeeper，不占用现有实例。"""
     def __init__(self, work, classpath):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0)); self.port = sock.getsockname()[1]
@@ -180,6 +183,8 @@ def main():
             return record
         initial = expect('ready', False)
         expect('tcp')
+        # 真实发现链路下检查传输变换以及客户端销毁后的异步结果。
+        expect('transport')
         proxy.stall(); expect('registration-deadline')
         proxy.unstall(); initial = expect('deadline-recovered')
         proxy.pause(); expect('absent')

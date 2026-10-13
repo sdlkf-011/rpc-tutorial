@@ -186,7 +186,7 @@ bool ZkConnHandler::EnsureZkConnection() {
   return GetConnectedSession() != nullptr;
 }
 
-std::vector<std::string> ZkConnHandler::GetAllServers(
+ZkConnHandler::ServerSnapshot ZkConnHandler::GetAllServersSnapshot(
     const std::string& zk_namespace) {
   const auto session = GetConnectedSession();
   if (!session) {
@@ -207,7 +207,8 @@ std::vector<std::string> ZkConnHandler::GetAllServers(
       LOG_ERROR("Failed to get children: {}", zerror(rc));
       return {};
     }
-    std::vector<std::string> servers;
+    ServerSnapshot snapshot;
+    snapshot.complete = true;
     for (int i = 0; i < children.value.count; ++i) {
       const std::string node_path = (zk_namespace == "/" ? "" : zk_namespace) +
                                     "/" + children.value.data[i];
@@ -217,17 +218,24 @@ std::vector<std::string> ZkConnHandler::GetAllServers(
                    nullptr);
       if (rc == ZOK && buffer_len > 0 &&
           buffer_len <= static_cast<int>(sizeof(buffer))) {
-        servers.emplace_back(buffer, buffer_len);
+        snapshot.servers.emplace_back(buffer, buffer_len);
       } else {
+        // 即使还有其他可用地址，也不能据此推断读取失败的实例已经移除。
+        snapshot.complete = false;
         LOG_WARN("Failed to get data for node: {}, error: {}", node_path,
                  zerror(rc));
       }
     }
-    return servers;
+    return snapshot;
   } catch (const std::exception& e) {
-    LOG_ERROR("Exception in GetAllServers: {}", e.what());
+    LOG_ERROR("Exception in GetAllServersSnapshot: {}", e.what());
     return {};
   }
+}
+
+std::vector<std::string> ZkConnHandler::GetAllServers(
+    const std::string& zk_namespace) {
+  return GetAllServersSnapshot(zk_namespace).servers;
 }
 
 std::string ZkConnHandler::GetServer(const std::string& zk_namespace) {

@@ -46,7 +46,16 @@ class ZkConnHandler {
   // 初始化 ZooKeeper 连接处理器
   bool InitZkConnHandler(const nlohmann::json& config);
 
-  // 获取指定命名空间下的所有服务器列表
+  struct ServerSnapshot {
+    std::vector<std::string> servers;
+    // 目录与全部实例数据均读取成功才为真；成功空目录也属于完整结果。
+    bool complete = false;
+  };
+
+  // 返回本次查询的数据和完整性状态，两者归属于同一会话快照。
+  ServerSnapshot GetAllServersSnapshot(const std::string& zk_namespace);
+
+  // 获取本次可读的地址，可能是部分结果；需要清理历史状态时使用上面的接口。
   std::vector<std::string> GetAllServers(const std::string& zk_namespace);
 
   // 获取单个服务器地址
