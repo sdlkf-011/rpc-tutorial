@@ -5,11 +5,12 @@
 #include <pthread.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <unordered_map>
 
@@ -64,7 +65,12 @@ class MessageCycle {
   static constexpr size_t kSendBudget = 64 * 1024;
   static constexpr size_t kAcceptBudget = 64;
   const size_t max_connections_;
-  std::set<int> listen_fds_;
+  struct Listener {
+    bool paused = false;
+    std::chrono::steady_clock::time_point resume_at{};
+    std::chrono::milliseconds retry_delay{100};
+  };
+  std::map<int, Listener> listen_fds_;
   std::atomic<bool> running_;
   mutable std::mutex mutex_;
 
@@ -83,6 +89,9 @@ class MessageCycle {
 #endif
 
   void HandleNewConnection(int fd);
+  bool ConfigureListener(int fd, bool enabled);
+  void PauseListener(int fd, int error);
+  int RetryPausedListeners();
   void HandleClientData(uint64_t id);
   void FlushConnection(uint64_t id);
   bool UpdateInterest(uint64_t id);

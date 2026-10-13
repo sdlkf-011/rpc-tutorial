@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +29,12 @@
 namespace {
 using namespace std::chrono_literals;
 std::atomic<int> discovered_port{0};
+std::mutex discovery_data_mutex;
+std::string discovery_address_override;
+std::atomic<int> accept_error_fd{-1}, accept_error_code{0};
+std::mutex accept_error_mutex;
+std::condition_variable accept_error_cv;
+std::vector<std::chrono::steady_clock::time_point> accept_error_times;
 std::atomic<bool> monitor_accepts{false};
 std::atomic<size_t> accept_batch{0}, largest_accept_batch{0};
 thread_local bool interrupt_connect_poll = false;
@@ -41,6 +48,17 @@ struct FakeZk {
 extern "C" {
 int __real_accept(int, sockaddr*, socklen_t*);
 int __wrap_accept(int fd, sockaddr* address, socklen_t* length) {
+  const int error = accept_error_code.load();
+  if (fd == accept_error_fd.load() && error != 0) {
+    {
+      std::lock_guard<std::mutex> lock(accept_error_mutex);
+      if (accept_error_times.size() < 32)
+        accept_error_times.push_back(std::chrono::steady_clock::now());
+    }
+    accept_error_cv.notify_all();
+    errno = error;
+    return -1;
+  }
   const int accepted = __real_accept(fd, address, length);
   if (accepted >= 0 && monitor_accepts.load()) ++accept_batch;
   return accepted;
@@ -97,7 +115,13 @@ int __wrap_deallocate_String_vector(String_vector* children) {
 }
 int __wrap_zoo_get(zhandle_t*, const char*, int, char* buffer, int* length,
                    Stat*) {
-  const auto data = "127.0.0.1:" + std::to_string(discovered_port.load());
+  std::string data;
+  {
+    std::lock_guard<std::mutex> lock(discovery_data_mutex);
+    data = discovery_address_override.empty()
+               ? "127.0.0.1:" + std::to_string(discovered_port.load())
+               : discovery_address_override;
+  }
   if (static_cast<int>(data.size()) > *length) return ZMARSHALLINGERROR;
   std::memcpy(buffer, data.data(), data.size());
   *length = data.size();
@@ -251,6 +275,8 @@ class NetworkTest : public testing::Test {
     loop = std::thread([this] { cycle->Loop(); });
   }
   void TearDown() override {
+    accept_error_code = 0;
+    accept_error_fd = -1;
     auto service = TestService();
     {
       std::lock_guard<std::mutex> lock(service->mutex);
@@ -263,6 +289,67 @@ class NetworkTest : public testing::Test {
     EXPECT_EQ(ConnectionManager::GetInstance().GetConnectionCount(), 0u);
   }
 };
+
+TEST_F(NetworkTest, ResourceErrorsBackOffWhileExistingConnectionsRemainUsable) {
+  auto existing = listener.Client();
+  ASSERT_TRUE(existing->Write(Request("normal", 1)));
+  ASSERT_FALSE(ReadFrame(existing).empty());
+  uint32_t id = 2;
+  for (int error : {EMFILE, ENFILE, ENOBUFS, ENOMEM}) {
+    {
+      std::lock_guard<std::mutex> lock(accept_error_mutex);
+      accept_error_times.clear();
+    }
+    accept_error_fd = listener.fd.value;
+    accept_error_code = error;
+    auto pending = listener.Client();
+    {
+      std::unique_lock<std::mutex> lock(accept_error_mutex);
+      ASSERT_TRUE(accept_error_cv.wait_for(
+          lock, 2s, [] { return !accept_error_times.empty(); }));
+    }
+    ASSERT_TRUE(existing->Write(Request("normal", id++)));
+    EXPECT_FALSE(ReadFrame(existing).empty());
+    {
+      std::unique_lock<std::mutex> lock(accept_error_mutex);
+      ASSERT_TRUE(accept_error_cv.wait_for(
+          lock, 2s, [] { return accept_error_times.size() >= 3; }));
+      EXPECT_GE(accept_error_times[1] - accept_error_times[0], 90ms);
+      EXPECT_GE(accept_error_times[2] - accept_error_times[1], 180ms);
+    }
+    EXPECT_EQ(cycle->GetListenFdCount(), 1u);
+    accept_error_code = 0;
+    ASSERT_TRUE(pending->Write(Request("normal", id++)));
+    EXPECT_FALSE(ReadFrame(pending).empty());
+    pending->Close();
+    ASSERT_TRUE(Eventually([] {
+      return ConnectionManager::GetInstance().GetConnectionCount() == 1;
+    }));
+  }
+}
+
+TEST_F(NetworkTest,
+       RemovingPausedListenerCancelsItsRetryAndAllowsFreshRegistration) {
+  {
+    std::lock_guard<std::mutex> lock(accept_error_mutex);
+    accept_error_times.clear();
+  }
+  accept_error_fd = listener.fd.value;
+  accept_error_code = EMFILE;
+  auto pending = listener.Client();
+  {
+    std::unique_lock<std::mutex> lock(accept_error_mutex);
+    ASSERT_TRUE(accept_error_cv.wait_for(
+        lock, 2s, [] { return !accept_error_times.empty(); }));
+  }
+  EXPECT_TRUE(cycle->RemoveListenFd(listener.fd.value));
+  accept_error_code = 0;
+  EXPECT_EQ(cycle->GetListenFdCount(), 0u);
+  EXPECT_TRUE(pending->ReadWithTimeout(250).timeout);
+  ASSERT_TRUE(cycle->AddListenFd(listener.fd.value));
+  ASSERT_TRUE(pending->Write(Request("normal", 1)));
+  EXPECT_FALSE(ReadFrame(pending).empty());
+}
 
 class ConnectionCapacityTest : public NetworkTest {
   void SetUp() override {
@@ -563,6 +650,38 @@ TEST(RpcClientNetworkTest, ConnectInterruptionsConsumeOneTotalDeadline) {
   ASSERT_EQ(connect_poll_timeouts.size(), 4u);
   EXPECT_LT(connect_poll_timeouts.back(), connect_poll_timeouts.front() - 15);
   EXPECT_LE(connect_poll_timeouts.front(), 100);
+}
+
+TEST(RpcClientNetworkTest,
+     DiscoveryRejectsNoncanonicalAndNulContainingIpv4Text) {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("rpc-ip-validation-" + std::to_string(getpid()) + ".json");
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::filesystem::remove(path);
+      std::lock_guard<std::mutex> lock(discovery_data_mutex);
+      discovery_address_override.clear();
+    }
+  } cleanup{path};
+  std::ofstream(path) << nlohmann::json{{"timeout_ms", 100},
+                                        {"retry_times", 0}};
+  Listener listener;
+  RpcClient client(path.string());
+  for (const auto& ip : std::vector<std::string>{
+           "127.000.0.1", "127.0.0.1 ", std::string("127.0.0.1\0bad", 13)}) {
+    {
+      std::lock_guard<std::mutex> lock(discovery_data_mutex);
+      discovery_address_override = ip + ":" + std::to_string(listener.port);
+    }
+    EXPECT_FALSE(client.Connect());
+    client.Disconnect();
+  }
+  {
+    std::lock_guard<std::mutex> lock(discovery_data_mutex);
+    discovery_address_override = "127.0.0.1:" + std::to_string(listener.port);
+  }
+  EXPECT_TRUE(client.Connect());
 }
 
 TEST(ConnectionTest, RawOversizedResponseAlsoBecomesAShortError) {

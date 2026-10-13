@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <deque>
@@ -190,46 +191,86 @@ MessageCycle::~MessageCycle() {
 #endif
 }
 
-bool MessageCycle::AddListenFd(int fd) {
-  // 监听注册模块：将监听 fd 加入平台事件后端和本地集合。
-  if (!IsValidFileDescriptor(fd) || !SetNonBlockingAndCloseOnExec(fd)) {
-    return false;
-  }
-
-  std::lock_guard<std::mutex> lock(mutex_);
-  // 集合和事件后端在同一临界区更新，避免并发增删产生重复注册。
-  if (listen_fds_.find(fd) != listen_fds_.end()) {
-    return true;
-  }
-
+// 调用者持有 mutex_，监听注册、暂停和恢复使用相同的事件标识。
+bool MessageCycle::ConfigureListener(int fd, bool enabled) {
 #ifdef __APPLE__
-  if (kqueue_fd_ < 0) {
-    return false;
-  }
   struct kevent event;
-  EV_SET(&event, fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0,
-         reinterpret_cast<void*>(kListenTag | static_cast<uint64_t>(fd)));
-  if (kevent(kqueue_fd_, &event, 1, nullptr, 0, nullptr) < 0) {
-    LOG_ERROR("Failed to add listen fd {} to kqueue: {}", fd,
-              std::strerror(errno));
-    return false;
-  }
+  EV_SET(&event, fd, EVFILT_READ, enabled ? EV_ADD | EV_ENABLE : EV_DISABLE, 0,
+         0, reinterpret_cast<void*>(kListenTag | static_cast<uint64_t>(fd)));
+  return kevent(kqueue_fd_, &event, 1, nullptr, 0, nullptr) == 0;
 #else
-  if (epoll_fd_ < 0) {
-    return false;
-  }
   epoll_event event{};
   event.events = EPOLLIN;
   event.data.u64 = kListenTag | static_cast<uint64_t>(fd);
-  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event) < 0) {
-    LOG_ERROR("Failed to add listen fd {} to epoll: {}", fd,
-              std::strerror(errno));
+  return epoll_ctl(epoll_fd_, enabled ? EPOLL_CTL_ADD : EPOLL_CTL_DEL, fd,
+                   &event) == 0;
+#endif
+}
+
+bool MessageCycle::AddListenFd(int fd) {
+  if (!IsValidFileDescriptor(fd) || !SetNonBlockingAndCloseOnExec(fd))
+    return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto inserted = listen_fds_.try_emplace(fd);
+  if (!inserted.second) return true;
+  if (!ConfigureListener(fd, true)) {
+    listen_fds_.erase(inserted.first);
+    LOG_ERROR("Failed to register listener {}: {}", fd, std::strerror(errno));
     return false;
   }
-#endif
-
-  listen_fds_.insert(fd);
+  notifications_->Wake();
   return true;
+}
+
+void MessageCycle::PauseListener(int fd, int error) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto found = listen_fds_.find(fd);
+  if (found == listen_fds_.end() || found->second.paused) return;
+  if (!ConfigureListener(fd, false)) {
+    LOG_ERROR("Failed to pause listener {}: {}", fd, std::strerror(errno));
+    Stop();  // 后端无法取消订阅时退出，避免在持续可读事件上空转。
+    return;
+  }
+  auto& listener = found->second;
+  listener.paused = true;
+  listener.resume_at = std::chrono::steady_clock::now() + listener.retry_delay;
+  LOG_WARN("Pausing listener {} after {} for {}ms", fd, std::strerror(error),
+           listener.retry_delay.count());
+  listener.retry_delay =
+      std::min(listener.retry_delay * 2, std::chrono::milliseconds(1000));
+}
+
+int MessageCycle::RetryPausedListeners() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  int timeout_ms = 100;
+  const auto now = std::chrono::steady_clock::now();
+  for (auto it = listen_fds_.begin(); it != listen_fds_.end();) {
+    auto& listener = it->second;
+    if (listener.paused && !stop_requested_.load()) {
+      if (now >= listener.resume_at) {
+        if (ConfigureListener(it->first, true)) {
+          listener.paused = false;
+        } else if (errno == EBADF || errno == ENOENT) {
+          it = listen_fds_.erase(it);
+          continue;
+        } else {
+          listener.resume_at = now + listener.retry_delay;
+          listener.retry_delay = std::min(listener.retry_delay * 2,
+                                          std::chrono::milliseconds(1000));
+        }
+      }
+      if (listener.paused) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                listener.resume_at - now)
+                .count();
+        timeout_ms = std::min(
+            timeout_ms, static_cast<int>(std::max<int64_t>(1, remaining)));
+      }
+    }
+    ++it;
+  }
+  return timeout_ms;
 }
 
 bool MessageCycle::RemoveListenFd(int fd) {
@@ -270,6 +311,7 @@ void MessageCycle::Loop() {
   auto drain_deadline = std::chrono::steady_clock::time_point::max();
   while (true) {
     ProcessNotifications();
+    const int event_timeout_ms = RetryPausedListeners();
     if (stop_requested_.load()) {
       if (!draining) {
         draining = true;
@@ -278,7 +320,8 @@ void MessageCycle::Loop() {
         std::vector<int> listeners;
         {
           std::lock_guard<std::mutex> lock(mutex_);
-          listeners.assign(listen_fds_.begin(), listen_fds_.end());
+          for (const auto& listener : listen_fds_)
+            listeners.push_back(listener.first);
         }
         for (int fd : listeners) RemoveListenFd(fd);
         std::vector<uint64_t> ids;
@@ -295,12 +338,13 @@ void MessageCycle::Loop() {
     }
 #ifdef __APPLE__
     struct kevent events[MAX_EVENTS];
-    timespec timeout{0, 100 * 1000 * 1000};
+    timespec timeout{0, event_timeout_ms * 1000 * 1000};
     const int count =
         kevent(kqueue_fd_, nullptr, 0, events, MAX_EVENTS, &timeout);
 #else
     epoll_event events[MAX_EVENTS];
-    const int count = epoll_wait(epoll_fd_, events, MAX_EVENTS, 100);
+    const int count =
+        epoll_wait(epoll_fd_, events, MAX_EVENTS, event_timeout_ms);
 #endif
     if (count < 0) {
       if (errno == EINTR) continue;
@@ -395,6 +439,11 @@ void MessageCycle::HandleEpollEvents(struct epoll_event* events, int count) {
 #endif
 
 void MessageCycle::HandleNewConnection(int fd) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = listen_fds_.find(fd);
+    if (found == listen_fds_.end() || found->second.paused) return;
+  }
   // LT 后端会再次报告可读；每轮限制 accept 次数，给已有连接处理机会。
   for (size_t accepted = 0;
        accepted < kAcceptBudget && running_.load() && !stop_requested_.load();
@@ -402,14 +451,24 @@ void MessageCycle::HandleNewConnection(int fd) {
     const int client_fd = accept(fd, nullptr, nullptr);
 
     if (client_fd < 0) {
-      if (errno == EINTR) continue;
-      if (errno != EAGAIN && errno != EWOULDBLOCK) {
-        LOG_ERROR("Failed to accept connection on fd {}: {}", fd,
-                  std::strerror(errno));
+      const int error = errno;
+      if (error == EINTR || error == ECONNABORTED || error == EPROTO) continue;
+      if (error == EAGAIN || error == EWOULDBLOCK) return;
+      if (error == EBADF || error == EINVAL || error == ENOTSOCK) {
+        LOG_ERROR("Removing invalid listener {}: {}", fd, std::strerror(error));
+        RemoveListenFd(fd);
+        return;
       }
+      PauseListener(fd, error);
       return;
     }
 
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto found = listen_fds_.find(fd);
+      if (found != listen_fds_.end())
+        found->second.retry_delay = std::chrono::milliseconds(100);
+    }
     if (clients_.size() >= max_connections_) {
       close(client_fd);
       continue;

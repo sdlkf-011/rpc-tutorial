@@ -40,7 +40,7 @@ flowchart LR
     Service -->|处理结果与响应入队| IO
 ```
 
-服务端事件线程每轮最多接入 64 个连接，并负责连接的读写、事件注销和关闭；工作线程处理业务并提交响应帧。客户端在一条 TCP 连接上串行执行调用，发送与接收均使用明确的等待期限。
+fd 或 socket 资源不足时，监听读事件暂停并按 100 毫秒至 1 秒退避恢复，已有连接继续处理。服务端事件线程每轮最多接入 64 个连接，并负责连接的读写、事件注销和关闭；工作线程处理业务并提交响应帧。客户端在一条 TCP 连接上串行执行调用，发送与接收均使用明确的等待期限。
 
 ## 环境要求
 
@@ -49,6 +49,7 @@ flowchart LR
 - 构建测试时需要 GoogleTest 和 Python 3；`BUILD_TESTING` 默认开启。
 - 运行示例与压测时需要可访问的 ZooKeeper 服务，示例地址为 `localhost:2181`。
 - 可选真实集成测试还需要 Java 和 ZooKeeper 服务端 jars。
+- 构建与压测脚本需要 Bash 和 GNU 命令行工具，压测脚本还需要 util-linux 的 `setsid`。
 
 ZooKeeper C client 必须启用同步 API。使用 vcpkg 时安装 `zookeeper[sync]`；CMake 会检查该能力，缺失时停止配置。
 
@@ -147,6 +148,8 @@ ZooKeeper 连接就绪后才提交新的客户端配置；提交时断开现有 
 | `scheduler.retry_interval` | 毫秒值，入口转换为至少 1 秒的 ZooKeeper 等待间隔 |
 | `register_config` | 服务注册配置文件路径，如 `../config/servers.json` |
 
+监听和注册地址使用标准 IPv4 文本，配置与 socket 层采用相同校验，拒绝前导零、空白和嵌入 NUL。
+
 数值配置只接受范围内的整数，拒绝布尔值、浮点数和溢出值。服务端及子配置全部解析、校验成功后统一提交；注册配置重新加载时替换实例列表。配置加载不代表运行中的监听地址或线程池支持热更新。
 
 `servers.json` 的 `service_name` 决定发现目录，`registry_nodes` 决定实例地址；`service_version` 当前仅作为配置元数据保存。注册根路径固定为 `/cookrpc`，修改 `scheduler.zk_namespace` 不会改写它。
@@ -155,7 +158,7 @@ ZooKeeper 连接就绪后才提交新的客户端配置；提交时断开现有 
 
 服务端配置中的顶层及 `scheduler.load_balance_strategy` 不参与入口的策略初始化。客户端通过自己的 `load_balance_strategy` 选择策略。
 
-直接启动可执行程序时，相对路径以进程工作目录为基准；`register_config` 也遵循此规则。示例程序的日志目录为 `../logs`，文件日志每天零点滚动。使用自定义构建目录时，可为注册配置填写绝对路径。
+直接启动可执行程序时，相对路径以进程工作目录为基准；`register_config` 也遵循此规则。示例程序的日志目录为 `../logs`，文件日志每天零点滚动，文件名为 `cookrpc_YYYY-MM-DD.log`。使用自定义构建目录时，可为注册配置填写绝对路径。
 
 ## 构建选项
 
@@ -181,7 +184,7 @@ CMake 提供 `BUILD_TESTING` 和 `RPC_ENABLE_LIVE_TESTS` 两个测试开关。�
 ctest --test-dir build --output-on-failure
 ```
 
-常规测试涵盖协议、序列化、配置、服务管理、负载均衡、线程池、压缩、加密和脚本。Linux 下还包含真实本地 TCP 测试，以及通过替换 ZooKeeper C API 控制交错的发现与注册测试；这些测试不要求启动外部 ZooKeeper。
+常规测试涵盖协议、序列化、配置、服务管理、负载均衡、线程池、压缩、加密、日志滚动和脚本。Linux 下还包含真实本地 TCP 测试，以及通过替换 ZooKeeper C API 控制交错的发现与注册测试；这些测试不要求启动外部 ZooKeeper。压测客户端回归使用真实 TCP，仅替换发现 API，验证错误响应类型计为失败而不会终止进程。
 
 ### 真实 TCP 与 ZooKeeper 集成测试
 
@@ -246,11 +249,14 @@ ZooKeeper 和 RPC 服务均已就绪时：
   --server-log './test logs/server.log' --start-server
 ```
 
-压测使用多个独立客户端与长连接，并发调用 `RpcService.Echo`，校验返回消息，输出成功率、吞吐量、平均延迟及 P50/P95/P99。连接准备不计入测试窗口；延迟样本包含成功与失败调用。具体参数与环境变量见 `./stress_test.sh --help`。
+压测使用多个独立客户端与长连接，并发调用 `RpcService.Echo`，校验返回消息，输出成功率、吞吐量、平均延迟及 P50/P95/P99。连接准备不计入测试窗口；延迟样本包含成功与失败调用。错误类型、缺失字段和不匹配的 Echo 值均计为失败，压测返回非零状态。具体参数与环境变量见 `./stress_test.sh --help`。
+
+脚本跟踪自己启动的构建、客户端和服务端进程组；`SIGINT` 与 `SIGTERM` 分别返回 130、143，并清理这些进程及其子进程。停止宽限期默认 10 秒，可通过 `--shutdown-timeout` 或 `SHUTDOWN_TIMEOUT_SECONDS` 设置为 1–60 秒；宽限期后仍未退出的进程会被强制结束，可能中止在途请求。
 
 ## 项目结构
 
 ```text
+cmake/                      依赖查找与目标配置辅助模块
 config/                     服务端、客户端及注册节点配置
 protos/                     Protobuf 消息定义
 rpc_src/
@@ -280,7 +286,9 @@ utils/                      日志与工具函数
 
 ## 开发说明
 
-内部头文件使用 `#include "connection.h"` 等不带模块目录的形式，搜索路径由 `rpc_common` 的 CMake 配置提供。新增模块时同步维护 include 路径；第三方头文件保持其标准路径。
+内部头文件使用 `#include "connection.h"` 等不带模块目录的形式，搜索路径由 `rpc_common` 的 CMake 配置提供。公共库使用显式源码列表，新增模块时同步维护主 `CMakeLists.txt` 中的源码和 include 路径；第三方头文件保持其标准路径。
+
+构建入口定义公共库和三个程序；依赖查找位于 `cmake/RpcDependencies.cmake`，目标公共设置位于 `cmake/RpcTargets.cmake`，测试目标由 `rpc_src/test/CMakeLists.txt` 管理。所有可执行文件保留在构建目录顶层。
 
 修改 `.proto` 后重新构建，CMake 会在构建目录生成 C++ 文件。提交前检查 `git diff --check`，并根据变更运行相关测试及完整 CTest。
 

@@ -1,6 +1,8 @@
 """Exercise script argv/cwd/cache behavior with local fake programs, no SDK download."""
 import json
 import os
+import signal
+import time
 from pathlib import Path
 import subprocess
 import tempfile
@@ -15,7 +17,8 @@ class ScriptTests(unittest.TestCase):
         self.work = Path(self.temp.name)
         self.env = os.environ.copy()
         for key in ("BUILD_DIR", "BUILD_FIRST", "START_SERVER", "SERVER_LOG", "CLIENT_CONFIG", "SERVER_CONFIG",
-                    "VCPKG_ROOT", "VCPKG_TARGET_TRIPLET", "VCPKG_DEFAULT_TRIPLET", "CMAKE_TOOLCHAIN_FILE"):
+                    "VCPKG_ROOT", "VCPKG_TARGET_TRIPLET", "VCPKG_DEFAULT_TRIPLET", "CMAKE_TOOLCHAIN_FILE",
+                    "SHUTDOWN_TIMEOUT_SECONDS"):
             self.env.pop(key, None)
 
     def program(self, path, code):
@@ -62,6 +65,113 @@ assert path.is_absolute() and path.read_text() == '{}'
         self.env.update(BUILD_DIR="build", CLIENT_CONFIG="client.json")
         result = self.run_script("stress_test.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_stress_cancellation_stops_owned_process_groups_and_reports_signal(self):
+        for sig, ignored in ((signal.SIGTERM, False), (signal.SIGINT, False),
+                             (signal.SIGTERM, True)):
+            with self.subTest(signal=sig, ignores_term=ignored):
+                build = self.work / ('cancel-' + str(sig) + '-' + str(ignored))
+                client_config = self.work / 'cancel-client.json'
+                server_config = self.work / 'cancel-server.json'
+                client_config.write_text('{}'); server_config.write_text('{}')
+                client_trace = build / 'client.json'; server_trace = build / 'server.json'
+                self.program(build / 'rpc_server', """import json, os, pathlib, signal, sys, time
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+pathlib.Path(os.environ['SERVER_TRACE']).write_text(json.dumps({'pid': os.getpid(), 'group': os.getpgrp()}))
+print('RPC server started', flush=True)
+while True: time.sleep(.1)
+""")
+                self.program(build / 'stress_test_client', """import json, os, pathlib, signal, subprocess, sys, time
+ignored = os.environ['IGNORE_TERM'] == '1'
+child_code = 'import signal,time; ' + ('signal.signal(signal.SIGTERM, signal.SIG_IGN); ' if ignored else '') + 'time.sleep(30)'
+child = subprocess.Popen([sys.executable, '-c', child_code])
+def stop(*_):
+    child.terminate()
+    try: child.wait(timeout=1)
+    except subprocess.TimeoutExpired: child.kill(); child.wait()
+    sys.exit(0)
+signal.signal(signal.SIGTERM, signal.SIG_IGN if ignored else stop)
+pathlib.Path(os.environ['CLIENT_TRACE']).write_text(json.dumps({'pid': os.getpid(), 'group': os.getpgrp(), 'child': child.pid}))
+while True: time.sleep(.1)
+""")
+                env = self.env.copy()
+                env.update(CLIENT_TRACE=str(client_trace), SERVER_TRACE=str(server_trace),
+                           IGNORE_TERM='1' if ignored else '0', SHUTDOWN_TIMEOUT_SECONDS='1')
+                command = ['bash', str(ROOT / 'stress_test.sh'), '--start-server',
+                           '--build-dir', str(build), '--client-config', str(client_config),
+                           '--server-config', str(server_config), '--server-log', str(build / 'server.log')]
+                process = subprocess.Popen(command, env=env, cwd=self.work,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           start_new_session=True)
+                records = []
+                try:
+                    deadline = time.monotonic() + 4
+                    while not client_trace.exists() and time.monotonic() < deadline:
+                        self.assertIsNone(process.poll())
+                        time.sleep(.01)
+                    self.assertTrue(client_trace.exists(), 'client did not start')
+                    records = [json.loads(path.read_text()) for path in (server_trace, client_trace)]
+                    start = time.monotonic()
+                    process.send_signal(sig)
+                    self.assertEqual(process.wait(timeout=4), 128 + sig)
+                    self.assertLess(time.monotonic() - start, 4)
+                    for record in records:
+                        for pid in (record['pid'], record.get('child')):
+                            if pid is None: continue
+                            state = Path('/proc') / str(pid) / 'stat'
+                            self.assertTrue(not state.exists() or state.read_text().split()[2] == 'Z',
+                                            f'owned child {pid} still running')
+                finally:
+                    groups = {process.pid}
+                    groups.update(record['group'] for record in records)
+                    for group in groups:
+                        try: os.killpg(group, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                    process.wait(timeout=4)
+
+    def test_stress_cancellation_during_build_stops_build_descendants(self):
+        fake = self.work / 'build-tools'
+        trace = self.work / 'build-started.json'
+        config = self.work / 'build-client.json'; config.write_text('{}')
+        self.program(fake / 'cmake', """import json, os, pathlib, signal, subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+def stop(*_):
+    child.terminate(); child.wait(timeout=2); sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+pathlib.Path(os.environ['BUILD_TRACE']).write_text(json.dumps({'pid': os.getpid(), 'group': os.getpgrp(), 'child': child.pid}))
+while True: time.sleep(.1)
+""")
+        env = self.env.copy()
+        env.update(PATH=str(fake) + os.pathsep + env['PATH'], BUILD_TRACE=str(trace),
+                   SHUTDOWN_TIMEOUT_SECONDS='1', BUILD_JOBS='1')
+        process = subprocess.Popen(['bash', str(ROOT / 'stress_test.sh'), '--build',
+            '--build-dir', str(self.work / 'build-cancel'), '--client-config', str(config)],
+            env=env, cwd=self.work, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        record = None
+        try:
+            deadline = time.monotonic() + 4
+            while not trace.exists() and time.monotonic() < deadline:
+                self.assertIsNone(process.poll()); time.sleep(.01)
+            self.assertTrue(trace.exists())
+            record = json.loads(trace.read_text())
+            process.send_signal(signal.SIGTERM)
+            self.assertEqual(process.wait(timeout=4), 143)
+            for pid in (record['pid'], record['child']):
+                state = Path('/proc') / str(pid) / 'stat'
+                self.assertTrue(not state.exists() or state.read_text().split()[2] == 'Z')
+        finally:
+            for group in {process.pid, record['group'] if record else process.pid}:
+                try: os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError: pass
+            process.wait(timeout=4)
+
+    def test_stress_preserves_client_failure_status(self):
+        build = self.work / 'failure-build'
+        config = self.work / 'failure-client.json'; config.write_text('{}')
+        self.program(build / 'stress_test_client', 'raise SystemExit(7)\n')
+        result = self.run_script('stress_test.sh', ['--build-dir', str(build), '--client-config', str(config)])
+        self.assertEqual(result.returncode, 7, result.stderr)
 
     def test_build_passes_selected_triplet_and_refreshes_only_when_it_changes(self):
         fake = self.work / "tools"

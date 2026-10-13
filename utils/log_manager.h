@@ -93,8 +93,7 @@ class Logger {
 
       std::string log_file = log_dir + "/cookrpc.log";
       auto file_sink =
-          std::make_shared<spdlog::sinks::daily_file_format_sink_mt>(log_file,
-                                                                     0, 0);
+          std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0);
       if (!file_sink) {
         std::cerr << "Failed to create file sink" << file_sink << std::endl;
         return false;

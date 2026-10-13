@@ -60,6 +60,22 @@ TEST_F(ServerConfigTest, RejectsNarrowingBooleanFractionalAndNegativeNumbers) {
   }
 }
 
+TEST_F(ServerConfigTest, RejectsAddressesThatTheSocketLayerCannotParse) {
+  for (const auto* address :
+       {"127.000.0.1", "01.2.3.4", "127.0.0.1 ", "256.0.0.1"}) {
+    auto json = Good();
+    json["servers_ip"] = address;
+    EXPECT_FALSE(Load(json));
+    EXPECT_EQ(config.GetServersIp(), "127.0.0.1");
+    std::ofstream(registry_path) << nlohmann::json{
+        {"registry_nodes",
+         nlohmann::json::array({{{"address", address}, {"port", 8989}}})}};
+    ServiceRegistryConfig registry;
+    EXPECT_FALSE(registry.InitRegistryConfig(registry_path.string()));
+    EXPECT_EQ(registry.GetRegistryNodesSize(), 0u);
+  }
+}
+
 TEST_F(ServerConfigTest, FailedIpOrChildConfigPreservesTheWholeConfiguration) {
   const auto* pool = config.GetThreadPoolConfig();
   const auto* registry = config.GetServiceRegistryConfig();
