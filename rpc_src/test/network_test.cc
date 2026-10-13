@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -52,12 +53,47 @@ std::atomic<size_t> accept_batch{0}, largest_accept_batch{0};
 thread_local bool interrupt_connect_poll = false;
 thread_local int connect_interrupts = 0;
 thread_local std::vector<int> connect_poll_timeouts;
+// 只对测试调用线程注入本地错误，不实际耗尽进程或系统的文件描述符。
+thread_local bool monitor_socket_initialization = false;
+thread_local int socket_initialization_error = 0;
+thread_local int socket_option_error = 0;
+thread_local int last_initialized_socket = -1;
+thread_local size_t socket_initialization_calls = 0;
+thread_local size_t remote_connect_calls = 0;
 struct FakeZk {
   watcher_fn watcher;
   void* context;
 };
 }  // namespace
 extern "C" {
+int __real_socket(int, int, int);
+int __wrap_socket(int domain, int type, int protocol) {
+  if (monitor_socket_initialization) {
+    ++socket_initialization_calls;
+    if (socket_initialization_error) {
+      errno = socket_initialization_error;
+      return -1;
+    }
+  }
+  const int fd = __real_socket(domain, type, protocol);
+  if (monitor_socket_initialization) last_initialized_socket = fd;
+  return fd;
+}
+int __real_setsockopt(int, int, int, const void*, socklen_t);
+int __wrap_setsockopt(int fd, int level, int option, const void* value,
+                      socklen_t length) {
+  if (monitor_socket_initialization && socket_option_error &&
+      fd == last_initialized_socket) {
+    errno = socket_option_error;
+    return -1;
+  }
+  return __real_setsockopt(fd, level, option, value, length);
+}
+int __real_connect(int, const sockaddr*, socklen_t);
+int __wrap_connect(int fd, const sockaddr* address, socklen_t length) {
+  if (monitor_socket_initialization) ++remote_connect_calls;
+  return __real_connect(fd, address, length);
+}
 int __real_accept(int, sockaddr*, socklen_t*);
 int __wrap_accept(int fd, sockaddr* address, socklen_t* length) {
   const int error = accept_error_code.load();
@@ -1134,6 +1170,70 @@ TEST_F(NetworkTest,
   const auto failed = handler.GetAllServersSnapshot("/cookrpc");
   EXPECT_FALSE(failed.complete);
   EXPECT_TRUE(failed.servers.empty());
+}
+
+TEST_F(NetworkTest, LocalSocketInitializationFailureDoesNotTripAnyInstance) {
+  Listener other;
+  auto service = std::make_shared<EchoTestService>("SocketResourcesEcho");
+  ASSERT_TRUE(ServiceManager::GetInstance().RegisterService(service));
+  {
+    std::lock_guard<std::mutex> lock(discovery_data_mutex);
+    discovery_nodes = std::vector<DiscoveryNode>{
+        {"A", "127.0.0.1:" + std::to_string(other.port)},
+        {"B", "127.0.0.1:" + std::to_string(listener.port)}};
+  }
+  for (const auto& failure : {std::pair<int, int>{EMFILE, 0},
+                              {ENFILE, 0},
+                              {0, ENOBUFS},
+                              {0, EINVAL}}) {
+    SCOPED_TRACE(failure.first ? failure.first : failure.second);
+    ClientConfigFile config(
+        listener.port,
+        {{"load_balance_strategy", "round"},
+         {"circuit_breaker",
+          {{"failure_threshold", 1}, {"reset_timeout_ms", 60000}}}});
+    RpcClient client(config.path.string());
+    struct Injection {
+      Injection(int create_error, int option_error) {
+        socket_initialization_error = create_error;
+        socket_option_error = option_error;
+        last_initialized_socket = -1;
+        socket_initialization_calls = remote_connect_calls = 0;
+        monitor_socket_initialization = true;
+      }
+      ~Injection() {
+        monitor_socket_initialization = false;
+        socket_initialization_error = socket_option_error = 0;
+      }
+    } injection{failure.first, failure.second};
+    // 超过熔断阈值重复失败，A、B 都不能被这些本地错误污染。
+    for (int attempt = 0; attempt < 6; ++attempt) {
+      EXPECT_FALSE(client.Connect());
+      EXPECT_FALSE(client.IsConnected());
+    }
+    EXPECT_EQ(socket_initialization_calls, 6u);
+    EXPECT_EQ(remote_connect_calls, 0u);
+    if (failure.second) {
+      // socket 已创建但选项设置失败时，初始化入口必须回收该 fd。
+      ASSERT_GE(last_initialized_socket, 0);
+      errno = 0;
+      EXPECT_EQ(fcntl(last_initialized_socket, F_GETFD), -1);
+      EXPECT_EQ(errno, EBADF);
+    }
+    socket_initialization_error = socket_option_error = 0;
+    // 本地资源恢复后，无需等待 60 秒冷却，两个实例都应立即可建连。
+    EXPECT_TRUE(client.Connect());
+    client.Disconnect();
+    EXPECT_TRUE(client.Connect());
+    EXPECT_EQ(remote_connect_calls, 2u);
+    // 轮询的第二次恢复连接指向运行中的 RPC 实例，实际调用也应成功。
+    std::string response;
+    EXPECT_TRUE(client.Call("SocketResourcesEcho", "Echo",
+                            std::string("recovered"), SerializeType::JSON,
+                            response));
+    EXPECT_EQ(response, "recovered");
+  }
+  EXPECT_EQ(service->requests.load(), 4u);
 }
 }  // namespace
 }  // namespace cookrpc

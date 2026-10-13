@@ -41,12 +41,12 @@ add_test(NAME scripts_regression
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts_test.py")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # 只替换 ZooKeeper C API；网络和并发代码仍是生产实现。
+    # 模拟 ZooKeeper 发现；网络系统调用包装仅在注入故障时替换真实行为。
     set(RPC_DISCOVERY_WRAPS
         zookeeper_init zookeeper_close zoo_get_children zoo_get deallocate_String_vector)
 
     rpc_add_gtest(network_test SOURCES network_test.cc TIMEOUT 30
-        WRAP ${RPC_DISCOVERY_WRAPS} poll accept epoll_wait)
+        WRAP ${RPC_DISCOVERY_WRAPS} poll accept epoll_wait socket setsockopt connect)
     rpc_add_gtest(service_registry_test SOURCES service_registry_test.cc TIMEOUT 30
         WRAP zookeeper_init zookeeper_close zoo_exists zoo_wexists zoo_get
             zoo_create zoo_client_id zoo_acreate zoo_aexists zoo_awexists zoo_aget)

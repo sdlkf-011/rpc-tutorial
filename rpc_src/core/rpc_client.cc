@@ -149,7 +149,11 @@ bool RpcClientSession::ConnectUnlocked() {
                    server_address);
     } else {
       int fd = -1;
-      if (InitSocket(fd) && TryConnect(fd, server_ip, server_port, attempt)) {
+      // 本地 fd、标志或选项初始化失败时尚未访问实例，不能计入远端故障。
+      const bool initialized = InitSocket(fd);
+      const bool connected =
+          initialized && TryConnect(fd, server_ip, server_port, attempt);
+      if (connected) {
         // Connection 从构造开始接管成功的 fd，后续由 shared_ptr
         // 和析构函数负责关闭。
         auto connection = std::make_shared<Connection>(fd);
@@ -167,7 +171,10 @@ bool RpcClientSession::ConnectUnlocked() {
       if (fd >= 0) {
         close(fd);
       }
-      breaker_.Finish(server_address, CircuitBreaker::Outcome::kFailure);
+      // 仅实际建连失败计入熔断；建连后 Connection 的本地初始化失败也不计入。
+      if (initialized && !connected) {
+        breaker_.Finish(server_address, CircuitBreaker::Outcome::kFailure);
+      }
     }
 
     if (attempt < maximum_attempts) {
