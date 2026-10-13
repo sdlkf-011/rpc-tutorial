@@ -22,6 +22,7 @@
 
 #include "config_validation.h"
 #include "load_balancer.h"
+#include "utils_fun.h"
 #include "zk_conn_handler.h"
 
 namespace cookrpc {
@@ -242,11 +243,8 @@ bool RpcClient::ParseServerAddress(const std::string& server_address,
     }
   }
 
-  in_addr address{};
-  // inet_pton 同时完成 IPv4 格式校验，避免向 connect 传入非法地址。
-  if (server_ip.empty() ||
-      inet_pton(AF_INET, server_ip.c_str(), &address) != 1 ||
-      !IsValidPort(parsed_port)) {
+  // 与配置入口使用相同校验，转换为 C 字符串前先拒绝嵌入 NUL。
+  if (!IsValidIpAddress(server_ip) || !IsValidPort(parsed_port)) {
     return false;
   }
   server_port = static_cast<uint16_t>(parsed_port);

@@ -241,49 +241,63 @@ int main(int argc, char* argv[]) {
     // 工作线程创建模块：每个线程绑定一个客户端连接和独立统计槽位。
     for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
       workers.emplace_back([&, worker_index] {
-        // 统一起跑屏障：所有线程创建完成后才开始抢占请求序号。
-        {
-          std::unique_lock<std::mutex> lock(start_mutex);
-          start_condition.wait(lock, [&] { return started; });
-        }
-        if (cancelled.load(std::memory_order_acquire)) {
-          return;
-        }
-
-        WorkerResult& result = worker_results[worker_index];
-        // 预留本线程可能产生的样本容量，减少压测过程中的动态扩容。
-        const uint64_t reserve_count = options.requests / worker_count + 1;
-        result.latencies_us.reserve(static_cast<size_t>(reserve_count));
-
-        while (!cancelled.load(std::memory_order_relaxed)) {
-          // 原子序号分配保证每个请求只被一个线程执行，无需全局互斥锁。
-          const uint64_t request_id =
-              next_request.fetch_add(1, std::memory_order_relaxed);
-          if (request_id >= options.requests) {
-            break;
+        try {
+          // 统一起跑屏障：所有线程创建完成后才开始抢占请求序号。
+          {
+            std::unique_lock<std::mutex> lock(start_mutex);
+            start_condition.wait(lock, [&] { return started; });
+          }
+          if (cancelled.load(std::memory_order_acquire)) {
+            return;
           }
 
-          const nlohmann::json request = {{"message", payload},
-                                          {"request_id", request_id}};
-          nlohmann::json response;
-          // 仅测量 RPC 调用耗时，不包含请求构造和结果汇总等外围操作。
-          const auto request_started = std::chrono::steady_clock::now();
-          const bool called = clients[worker_index]->Call(
-              "RpcService", "Echo", request, cookrpc::SerializeType::JSON,
-              response);
-          const auto request_finished = std::chrono::steady_clock::now();
-          const auto latency =
-              std::chrono::duration_cast<std::chrono::microseconds>(
-                  request_finished - request_started);
-          result.latencies_us.push_back(static_cast<uint64_t>(latency.count()));
+          WorkerResult& result = worker_results[worker_index];
+          // 预留本线程可能产生的样本容量，减少压测过程中的动态扩容。
+          const uint64_t reserve_count = options.requests / worker_count + 1;
+          result.latencies_us.reserve(static_cast<size_t>(reserve_count));
 
-          // 响应校验模块：不仅检查调用返回值，还校验业务 Echo 返回的消息。
-          if (called && response.is_object() &&
-              response.value("received_message", "") == payload) {
-            ++result.succeeded;
-          } else {
-            ++result.failed;
+          while (!cancelled.load(std::memory_order_relaxed)) {
+            // 原子序号分配保证每个请求只被一个线程执行，无需全局互斥锁。
+            const uint64_t request_id =
+                next_request.fetch_add(1, std::memory_order_relaxed);
+            if (request_id >= options.requests) {
+              break;
+            }
+
+            const nlohmann::json request = {{"message", payload},
+                                            {"request_id", request_id}};
+            nlohmann::json response;
+            // 仅测量 RPC 调用耗时，不包含请求构造和结果汇总等外围操作。
+            const auto request_started = std::chrono::steady_clock::now();
+            const bool called = clients[worker_index]->Call(
+                "RpcService", "Echo", request, cookrpc::SerializeType::JSON,
+                response);
+            const auto request_finished = std::chrono::steady_clock::now();
+            const auto latency =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    request_finished - request_started);
+            result.latencies_us.push_back(
+                static_cast<uint64_t>(latency.count()));
+
+            // 响应校验模块：不仅检查调用返回值，还校验业务 Echo 返回的消息。
+            const auto echo = response.is_object()
+                                  ? response.find("received_message")
+                                  : response.end();
+            if (called && echo != response.end() && echo->is_string() &&
+                echo->get_ref<const std::string&>() == payload) {
+              ++result.succeeded;
+            } else {
+              ++result.failed;
+            }
           }
+        } catch (const std::exception& error) {
+          // 工作线程中的异常不会传播给创建线程；显式取消并确保 main
+          // 回收所有线程。
+          cancelled.store(true, std::memory_order_release);
+          std::cerr << "Stress-test worker failed: " << error.what() << '\n';
+        } catch (...) {
+          cancelled.store(true, std::memory_order_release);
+          std::cerr << "Stress-test worker failed with an unknown error\n";
         }
       });
     }
@@ -330,5 +344,6 @@ int main(int argc, char* argv[]) {
   PrintResults(options, succeeded, failed, latencies_us,
                test_finished - test_started);
   // 只有全部请求成功且数量吻合时才返回成功，便于脚本判断压测结果。
-  return failed == 0 && succeeded == options.requests ? 0 : 1;
+  return !cancelled.load() && failed == 0 && succeeded == options.requests ? 0
+                                                                           : 1;
 }

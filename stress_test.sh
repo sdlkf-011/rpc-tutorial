@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+set +m  # 子进程由 setsid 建立独立进程组，PID 同时作为组标识。
 
 # 基础配置模块：命令行参数可以覆盖同名环境变量提供的默认值。
 CALLER_DIR="${PWD}"
@@ -14,6 +15,9 @@ PAYLOAD_SIZE="${PAYLOAD_SIZE:-64}"
 BUILD_FIRST="${BUILD_FIRST:-0}"
 START_SERVER="${START_SERVER:-0}"
 SERVER_PID=""
+CLIENT_PID=""
+BUILD_PID=""
+SHUTDOWN_TIMEOUT_SECONDS="${SHUTDOWN_TIMEOUT_SECONDS:-10}"
 SERVER_LOG="${SERVER_LOG:-}"
 
 # 帮助模块：说明脚本能够管理的构建、服务端和压测参数。
@@ -31,11 +35,13 @@ Options:
   --server-config PATH   RPC server config file used with --start-server
   --build-dir PATH       Build directory (default: project build/)
   --server-log PATH      Log file used with --start-server
+  --shutdown-timeout N   Grace period before killing owned processes (1-60 seconds; default: 10)
   --help                 Show this help message
 
 The script requires ZooKeeper and a registered RPC service. Parameters can
 also be set with BUILD_DIR, BUILD_FIRST, START_SERVER, THREADS, REQUESTS,
-PAYLOAD_SIZE, CLIENT_CONFIG, SERVER_CONFIG, and SERVER_LOG environment variables.
+PAYLOAD_SIZE, CLIENT_CONFIG, SERVER_CONFIG, SERVER_LOG, and SHUTDOWN_TIMEOUT_SECONDS
+environment variables.
 EOF
 }
 
@@ -99,6 +105,11 @@ while [[ $# -gt 0 ]]; do
       SERVER_LOG="$2"
       shift 2
       ;;
+    --shutdown-timeout)
+      require_value "$@"
+      SHUTDOWN_TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
     --help)
       usage
       exit 0
@@ -108,6 +119,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+[[ "${SHUTDOWN_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]?$ ]] &&
+  (( SHUTDOWN_TIMEOUT_SECONDS <= 60 )) || fail "shutdown timeout must be an integer between 1 and 60"
+command -v setsid >/dev/null || fail "setsid is required for child process cleanup"
 
 # 路径始终按调用者工作目录解释，在构建或子进程 cd 前完成规范化。
 absolute_path() {
@@ -120,23 +135,54 @@ SERVER_CONFIG="$(absolute_path "${SERVER_CONFIG}")"
 BUILD_DIR="$(absolute_path "${BUILD_DIR}")"
 SERVER_LOG="$(absolute_path "${SERVER_LOG:-${BUILD_DIR}/stress_test_server.log}")"
 
+# 只操作本脚本创建的进程组；setsid 尚未完成时回退到直属子进程。
+child_alive() {
+  [[ -n "$1" ]] && { kill -0 -- "-$1" 2>/dev/null || kill -0 "$1" 2>/dev/null; }
+}
+signal_child() {
+  local child_pid="$1" child_signal="$2"
+  [[ -n "${child_pid}" ]] || return 0
+  if kill -0 -- "-${child_pid}" 2>/dev/null; then
+    kill "-${child_signal}" -- "-${child_pid}" 2>/dev/null || true
+  elif kill -0 "${child_pid}" 2>/dev/null; then
+    kill "-${child_signal}" "${child_pid}" 2>/dev/null || true
+  fi
+}
+cleanup() {
+  trap - EXIT
+  trap '' INT TERM
+  signal_child "${BUILD_PID}" TERM
+  signal_child "${CLIENT_PID}" TERM
+  signal_child "${SERVER_PID}" TERM
+  local cleanup_deadline=$((SECONDS + SHUTDOWN_TIMEOUT_SECONDS + 1))
+  while child_alive "${BUILD_PID}" || child_alive "${CLIENT_PID}" || child_alive "${SERVER_PID}"; do
+    (( SECONDS < cleanup_deadline )) || break
+    sleep 0.05
+  done
+  for child_pid in "${BUILD_PID}" "${CLIENT_PID}" "${SERVER_PID}"; do
+    [[ -n "${child_pid}" ]] || continue
+    signal_child "${child_pid}" KILL
+    wait "${child_pid}" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # 构建检查模块：显式要求构建或缺少目标程序时，复用项目构建脚本。
 [[ -f "${CLIENT_CONFIG}" ]] || fail "client config not found: ${CLIENT_CONFIG}"
 if [[ "${BUILD_FIRST}" == "1" || ! -x "${BUILD_DIR}/stress_test_client" ]]; then
   echo "Building RPC stress-test client..."
-  BUILD_DIR="${BUILD_DIR}" "${PROJECT_ROOT}/rpc_build.sh"
+  BUILD_DIR="${BUILD_DIR}" setsid "${PROJECT_ROOT}/rpc_build.sh" &
+  BUILD_PID=$!
+  if wait "${BUILD_PID}"; then
+    :
+  else
+    exit "$?"
+  fi
 fi
 [[ -x "${BUILD_DIR}/stress_test_client" ]] || \
   fail "stress-test client not found: ${BUILD_DIR}/stress_test_client"
-
-# 进程清理模块：仅回收由本脚本启动的服务端，避免压测中断后遗留进程。
-cleanup() {
-  if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-    kill -TERM "${SERVER_PID}" 2>/dev/null || true
-    wait "${SERVER_PID}" 2>/dev/null || true
-  fi
-}
-trap cleanup EXIT INT TERM
 
 # 本地服务编排模块：可选启动服务端，并等待其完成 ZooKeeper 注册。
 if [[ "${START_SERVER}" == "1" ]]; then
@@ -148,7 +194,7 @@ if [[ "${START_SERVER}" == "1" ]]; then
   mkdir -p -- "$(dirname "${SERVER_LOG}")"
   (
     cd "${BUILD_DIR}"
-    exec ./rpc_server "${SERVER_CONFIG}"
+    exec setsid ./rpc_server "${SERVER_CONFIG}"
   ) >"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
 
@@ -170,9 +216,15 @@ fi
 echo "Running stress test: threads=${THREADS}, requests=${REQUESTS}, payload=${PAYLOAD_SIZE} bytes"
 (
   cd "${BUILD_DIR}"
-  exec ./stress_test_client \
+  exec setsid ./stress_test_client \
     --config "${CLIENT_CONFIG}" \
     --threads "${THREADS}" \
     --requests "${REQUESTS}" \
     --payload-size "${PAYLOAD_SIZE}"
-)
+) &
+CLIENT_PID=$!
+if wait "${CLIENT_PID}"; then
+  exit 0
+else
+  exit "$?"
+fi

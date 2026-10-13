@@ -13,6 +13,7 @@
 #include <string>
 
 #include "log_manager.h"
+#include "utils_fun.h"
 
 namespace cookrpc {
 namespace {
@@ -96,7 +97,7 @@ bool CreateSocket::Init() {
     // Init 可重复调用，已初始化时直接复用现有监听 socket。
     return true;
   }
-  if (servers_ip_.empty() || servers_port_ == 0 ||
+  if (!IsValidIpAddress(servers_ip_) || servers_port_ == 0 ||
       servers_max_connections_ <= 0 || socket_timeout_ms_ < 0) {
     LOG_ERROR("Invalid RPC server socket configuration");
     return false;
