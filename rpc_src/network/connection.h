@@ -8,9 +8,11 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "rpc_protocol.h"
+#include "transport_codec.h"
 
 namespace cookrpc {
 
@@ -27,9 +29,13 @@ class Connection : public std::enable_shared_from_this<Connection> {
   // 定义消息回调函数类型
   using MessageCallback = std::function<void(const std::shared_ptr<Connection>&,
                                              const RpcRequest&)>;
+  // 原始完整帧交给工作线程解码，事件线程无需承担解压、解密开销。
+  using FrameCallback =
+      std::function<void(const std::shared_ptr<Connection>&, std::string)>;
   using CloseCallback = std::function<void(const std::shared_ptr<Connection>&)>;
 
-  explicit Connection(int fd);
+  explicit Connection(
+      int fd, std::shared_ptr<const TransportCodec> transport = nullptr);
   ~Connection();
 
   // 基础 IO 操作
@@ -90,6 +96,10 @@ class Connection : public std::enable_shared_from_this<Connection> {
     std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     message_callback_ = cb;
   }
+  void SetFrameCallback(FrameCallback callback) {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    frame_callback_ = std::move(callback);
+  }
   void SetCloseCallback(const CloseCallback& cb) {
     std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     close_callback_ = cb;
@@ -104,9 +114,12 @@ class Connection : public std::enable_shared_from_this<Connection> {
   void HandleError();
   friend class MessageCycle;
   bool QueueFrame(std::string data);
+  // 统一执行响应传输编码与超限转换，成功仅表示进入发送队列。
+  bool QueueResponse(const std::string& plain);
   void CloseFromEventLoop();
   bool NotifyEvent();
   int fd_ = -1;
+  std::shared_ptr<const TransportCodec> transport_;
   std::string peer_addr_ = "";
   uint16_t peer_port_ = 0;
 
@@ -116,12 +129,15 @@ class Connection : public std::enable_shared_from_this<Connection> {
   size_t write_bytes_ = 0;
   size_t in_flight_ = 0;
   bool read_eof_ = false;
+  uint32_t last_request_sequence_ = 0;
+  bool received_encrypted_request_ = false;
   bool close_requested_ = false;
   bool event_managed_ = false;
   EventCallback event_callback_;
   const uint64_t id_;
 
   MessageCallback message_callback_ = nullptr;
+  FrameCallback frame_callback_;
   CloseCallback close_callback_ = nullptr;
 
   static const size_t MAX_BUFFER_SIZE = 65536;

@@ -25,7 +25,9 @@
 
 #include "connection_manager.h"
 #include "error_code.h"
+#include "request_controls.h"
 #include "rpc_protocol.h"
+#include "transport_codec.h"
 
 namespace cookrpc {
 
@@ -33,7 +35,9 @@ namespace cookrpc {
 class MessageCycle {
  public:
   explicit MessageCycle(ConnectionManager* manager,
-                        size_t max_connections = 10000);
+                        size_t max_connections = 10000,
+                        TransportOptions transport = {},
+                        RateLimitOptions rate_limit = {});
   virtual ~MessageCycle();
 
   // 注册/注销监听文件描述符。
@@ -58,6 +62,8 @@ class MessageCycle {
     bool write_enabled = false;
   };
   std::shared_ptr<Notifications> notifications_;
+  std::shared_ptr<const TransportCodec> transport_;
+  RequestLimiter limiter_;
   std::unordered_map<uint64_t, Client> clients_;
   std::atomic<bool> stop_requested_{false};
   std::mutex loop_mutex_;
@@ -93,6 +99,9 @@ class MessageCycle {
   void PauseListener(int fd, int error);
   int RetryPausedListeners();
   void HandleClientData(uint64_t id);
+  // 在解压、解密前限流，再将完整帧与连接快照提交给工作线程。
+  void HandleRpcFrame(const std::shared_ptr<Connection>& conn,
+                      std::string frame);
   void FlushConnection(uint64_t id);
   bool UpdateInterest(uint64_t id);
   void RemoveConnection(uint64_t id);

@@ -6,6 +6,7 @@
 #include <string>
 
 #include "registry_config.h"
+#include "rpc_options.h"
 #include "thread_pool_config.h"
 
 namespace cookrpc {
@@ -20,7 +21,7 @@ class RpcServerConfig {
   // 初始化
   bool InitRpcServerConfig(const std::string& config_file);
 
-  // Setter
+  // 设置基础配置。
   void SetServersNameProfix(const std::string& servers_name_prefix) {
     servers_name_prefix_ = servers_name_prefix;
   }
@@ -35,7 +36,7 @@ class RpcServerConfig {
     max_connections_ = max_connections;
   }
 
-  // Getter
+  // 读取基础配置。
   const std::string& GetServersNameProfix() const {
     return servers_name_prefix_;
   }
@@ -48,6 +49,13 @@ class RpcServerConfig {
 
   uint32_t GetMaxConnections() const { return max_connections_; }
   uint32_t GetListenBacklog() const { return listen_backlog_; }
+  // 启动事件循环时传入配置快照；运行中的连接不支持热切换传输模式。
+  const TransportOptions& GetTransportOptions() const {
+    return transport_options_;
+  }
+  const RateLimitOptions& GetRateLimitOptions() const {
+    return rate_limit_options_;
+  }
 
   // 获取子配置
   const ServiceRegistryConfig* GetServiceRegistryConfig() const {
@@ -67,6 +75,8 @@ class RpcServerConfig {
   // 基础配置
   uint32_t max_connections_ = 0;
   uint32_t listen_backlog_ = 1024;
+  TransportOptions transport_options_;
+  RateLimitOptions rate_limit_options_;
   std::string servers_ip_;
   uint16_t servers_port_ = 0;
   uint32_t timeout_ = 0;

@@ -9,12 +9,14 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -266,11 +268,14 @@ class NetworkTest : public testing::Test {
   std::unique_ptr<MessageCycle> cycle;
   std::thread loop;
   size_t connection_limit = 10000;
+  TransportOptions transport_options;
+  RateLimitOptions rate_limit_options;
   void SetUp() override {
     TestService();
     meeting_ctrl::ThreadPoolSingleton::Destroy();
     ASSERT_TRUE(meeting_ctrl::ThreadPoolSingleton::Init(1));
-    cycle = std::make_unique<MessageCycle>(nullptr, connection_limit);
+    cycle = std::make_unique<MessageCycle>(
+        nullptr, connection_limit, transport_options, rate_limit_options);
     ASSERT_TRUE(cycle->AddListenFd(listener.fd.value));
     loop = std::thread([this] { cycle->Loop(); });
   }
@@ -623,14 +628,15 @@ TEST(RpcClientNetworkTest, HalfResponseImmediatelyFollowedByCloseFails) {
 }
 
 struct ConnectWaitTag {
-  using type = bool (RpcClient::*)(int, int) const;
+  using type = bool (detail::RpcClientSession::*)(int, int) const;
   friend type ConnectWait(ConnectWaitTag);
 };
 template <class Tag, typename Tag::type Member>
 struct ExposeMember {
   friend typename Tag::type ConnectWait(Tag) { return Member; }
 };
-template struct ExposeMember<ConnectWaitTag, &RpcClient::WaitForConnection>;
+template struct ExposeMember<ConnectWaitTag,
+                             &detail::RpcClientSession::WaitForConnection>;
 TEST(RpcClientNetworkTest, ConnectInterruptionsConsumeOneTotalDeadline) {
   const auto path =
       std::filesystem::temp_directory_path() /
@@ -640,7 +646,7 @@ TEST(RpcClientNetworkTest, ConnectInterruptionsConsumeOneTotalDeadline) {
     ~Cleanup() { std::filesystem::remove(path); }
   } cleanup{path};
   std::ofstream(path) << nlohmann::json{{"timeout_ms", 100}};
-  RpcClient client(path.string());
+  detail::RpcClientSession client(path.string());
   connect_interrupts = 0;
   connect_poll_timeouts.clear();
   interrupt_connect_poll = true;
@@ -705,6 +711,266 @@ TEST(ConnectionTest, RawOversizedResponseAlsoBecomesAShortError) {
   EXPECT_EQ(response.GetErrorCode(),
             static_cast<uint32_t>(ErrorCode::kProtocolError));
   EXPECT_TRUE(response.GetResultData().empty());
+}
+
+// 每个用例独立设置并恢复测试密钥，编码器在构造时保存自己的密钥快照。
+struct SharedKey {
+  std::optional<std::string> previous;
+  SharedKey() {
+    if (const char* key = std::getenv("COOKRPC_MASTER_KEY_HEX")) previous = key;
+    setenv("COOKRPC_MASTER_KEY_HEX", std::string(64, '1').c_str(), 1);
+  }
+  ~SharedKey() {
+    if (previous)
+      setenv("COOKRPC_MASTER_KEY_HEX", previous->c_str(), 1);
+    else
+      unsetenv("COOKRPC_MASTER_KEY_HEX");
+  }
+};
+class EchoTestService : public Service {
+ public:
+  explicit EchoTestService(std::string name, std::shared_ptr<Gate> gate = {})
+      : name_(std::move(name)), gate_(std::move(gate)) {}
+  std::string GetServiceName() const override { return name_; }
+  bool HandleRequest(const std::string&, const std::string& args,
+                     std::string& result) override {
+    if (gate_) {
+      gate_->started.set_value();
+      gate_->signal.wait();
+    }
+    result = args;
+    return true;
+  }
+
+ private:
+  std::string name_;
+  std::shared_ptr<Gate> gate_;
+};
+// 使用真实 TCP 端口，仅替换 ZooKeeper 查询结果，保持客户端收发实现不变。
+struct ClientConfigFile {
+  std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      ("rpc-feature-client-" + std::to_string(getpid()) + ".json");
+  ClientConfigFile(uint16_t port,
+                   nlohmann::json extra = nlohmann::json::object()) {
+    discovered_port = port;
+    extra["zk_host"] = "fake";
+    extra["retry_times"] = 0;
+    extra["timeout_ms"] = 1000;
+    std::ofstream(path) << extra;
+  }
+  ~ClientConfigFile() { std::filesystem::remove(path); }
+};
+class SecuredNetworkTest : public NetworkTest {
+ protected:
+  SharedKey key;
+  void SetUp() override {
+    transport_options = {true, true, 0};
+    NetworkTest::SetUp();
+  }
+};
+TEST_F(SecuredNetworkTest,
+       ClientAndServerCompressEncryptAndDecodeTheActualRpcCall) {
+  ASSERT_TRUE(ServiceManager::GetInstance().RegisterService(
+      std::make_shared<EchoTestService>("SecureEcho")));
+  ClientConfigFile config(listener.port, {{"transport",
+                                           {{"compression", true},
+                                            {"encryption", true},
+                                            {"compression_threshold", 0}}}});
+  RpcClient client(config.path.string());
+  nlohmann::json request{{"message", std::string(16000, 'x')}}, response;
+  ASSERT_TRUE(client.Call("SecureEcho", "Echo", request, SerializeType::JSON,
+                          response));
+  EXPECT_EQ(response, request);
+}
+TEST_F(SecuredNetworkTest, IncorrectKeyOrPlainModeIsRejectedByTheServer) {
+  ClientConfigFile config(
+      listener.port,
+      {{"transport", {{"compression", true}, {"encryption", true}}}});
+  setenv("COOKRPC_MASTER_KEY_HEX", std::string(64, '2').c_str(), 1);
+  RpcClient wrong(config.path.string());
+  setenv("COOKRPC_MASTER_KEY_HEX", std::string(64, '1').c_str(), 1);
+  std::string response;
+  EXPECT_FALSE(wrong.Call("SecureEcho", "Echo", std::string("hello"),
+                          SerializeType::JSON, response));
+  ClientConfigFile plain_config(listener.port);
+  RpcClient plain(plain_config.path.string());
+  EXPECT_FALSE(plain.Call("SecureEcho", "Echo", std::string("hello"),
+                          SerializeType::JSON, response));
+}
+TEST_F(SecuredNetworkTest,
+       OversizedBusinessResponseReturnsAnAuthenticatedError) {
+  TransportCodec codec(transport_options);
+  std::string wire, plain;
+  ASSERT_TRUE(codec.Encode(Request("huge", 73), wire));
+  auto client = listener.Client();
+  ASSERT_TRUE(client->WriteWithTimeout(wire, 1000));
+  ASSERT_TRUE(codec.Decode(ReadFrame(client), plain));
+  RpcResponse response;
+  ASSERT_TRUE(response.Deserialize(plain));
+  EXPECT_EQ(response.GetSequenceId(), 73u);
+  EXPECT_EQ(response.GetErrorCode(),
+            static_cast<uint32_t>(ErrorCode::kProtocolError));
+  EXPECT_TRUE(response.GetResultData().empty());
+}
+class EncryptedNetworkTest : public SecuredNetworkTest {
+ protected:
+  void SetUp() override {
+    transport_options = {false, true, 1024};
+    NetworkTest::SetUp();
+  }
+};
+TEST_F(EncryptedNetworkTest,
+       EncryptionExpansionReturnsAnErrorInsteadOfDroppingBoundaryResult) {
+  // 原始响应刚好达到 body 上限；加密膨胀后必须回送可认证的短错误。
+  TransportCodec codec(transport_options);
+  std::string wire, plain;
+  ASSERT_TRUE(codec.Encode(Request("boundary", 74), wire));
+  auto client = listener.Client();
+  ASSERT_TRUE(client->WriteWithTimeout(wire, 1000));
+  ASSERT_TRUE(codec.Decode(ReadFrame(client), plain));
+  RpcResponse response;
+  ASSERT_TRUE(response.Deserialize(plain));
+  EXPECT_EQ(response.GetSequenceId(), 74u);
+  EXPECT_EQ(response.GetErrorCode(),
+            static_cast<uint32_t>(ErrorCode::kProtocolError));
+  EXPECT_TRUE(response.GetResultData().empty());
+}
+class LimitedNetworkTest : public NetworkTest {
+ protected:
+  void SetUp() override {
+    rate_limit_options = {1, 1};
+    NetworkTest::SetUp();
+  }
+};
+TEST_F(LimitedNetworkTest,
+       ExcessRequestReturnsRateLimitedAndDoesNotTripClientBreaker) {
+  // 将熔断阈值设为 1，确认有效限流响应不会被错误计为实例故障。
+  ASSERT_TRUE(ServiceManager::GetInstance().RegisterService(
+      std::make_shared<EchoTestService>("LimitedEcho")));
+  ClientConfigFile config(listener.port,
+                          {{"circuit_breaker", {{"failure_threshold", 1}}}});
+  RpcClient client(config.path.string());
+  std::string response;
+  ASSERT_TRUE(client.Call("LimitedEcho", "Echo", std::string("first"),
+                          SerializeType::JSON, response));
+  EXPECT_EQ(response, "first");
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_FALSE(client.Call("LimitedEcho", "Echo", std::string("excess"),
+                             SerializeType::JSON, response));
+    EXPECT_TRUE(client.IsConnected());
+  }
+}
+TEST_F(LimitedNetworkTest,
+       RateLimitErrorPreservesSequenceAndDoesNotConsumeWorkerQueue) {
+  auto client = listener.Client();
+  ASSERT_TRUE(client->Write(Request("normal", 81)));
+  ASSERT_FALSE(ReadFrame(client).empty());
+  ASSERT_TRUE(client->Write(Request("normal", 82)));
+  RpcResponse response;
+  ASSERT_TRUE(response.Deserialize(ReadFrame(client)));
+  EXPECT_EQ(response.GetSequenceId(), 82u);
+  EXPECT_EQ(response.GetErrorCode(),
+            static_cast<uint32_t>(ErrorCode::kRateLimited));
+  EXPECT_EQ(meeting_ctrl::ThreadPoolSingleton::GetQueueSize(), 0u);
+}
+TEST_F(NetworkTest,
+       AsyncCallOwnsSessionAfterClientIsDestroyedWhileResponseIsBlocked) {
+  auto gate = std::make_shared<Gate>();
+  ASSERT_TRUE(ServiceManager::GetInstance().RegisterService(
+      std::make_shared<EchoTestService>("AsyncLifetimeEcho", gate)));
+  ClientConfigFile config(listener.port);
+  auto client = std::make_unique<RpcClient>(config.path.string());
+  auto pending = client->AsyncCall<std::string>("AsyncLifetimeEcho", "Echo",
+                                                std::string("retained"),
+                                                SerializeType::JSON);
+  // 断言提前失败时也释放屏障，避免 future 析构无限等待业务返回。
+  struct Release {
+    std::shared_ptr<Gate> gate;
+    ~Release() { gate->Open(); }
+  } release{gate};
+  ASSERT_EQ(gate->started.get_future().wait_for(2s), std::future_status::ready);
+  // 确认请求已在业务线程中等待后销毁客户端，复现任务持有悬空对象的交错。
+  client.reset();
+  gate->Open();
+  ASSERT_EQ(pending.wait_for(2s), std::future_status::ready);
+  EXPECT_EQ(pending.get(), "retained");
+}
+
+TEST_F(SecuredNetworkTest, InvalidEncryptedReloadPreservesTheWorkingSession) {
+  ASSERT_TRUE(ServiceManager::GetInstance().RegisterService(
+      std::make_shared<EchoTestService>("ReloadEcho")));
+  ClientConfigFile config(
+      listener.port,
+      {{"transport", {{"compression", true}, {"encryption", true}}}});
+  RpcClient client(config.path.string());
+  std::string response;
+  ASSERT_TRUE(client.Call("ReloadEcho", "Echo", std::string("before"),
+                          SerializeType::JSON, response));
+  // 新配置因缺失密钥失败；当前连接仍使用已保存的密钥继续通信。
+  unsetenv("COOKRPC_MASTER_KEY_HEX");
+  EXPECT_FALSE(client.LoadConfig(config.path.string()));
+  EXPECT_TRUE(client.IsConnected());
+  EXPECT_TRUE(client.Call("ReloadEcho", "Echo", std::string("after"),
+                          SerializeType::JSON, response));
+  EXPECT_EQ(response, "after");
+}
+TEST_F(SecuredNetworkTest,
+       ReplayingAnEncryptedRequestOnTheSameConnectionIsRejected) {
+  TransportCodec codec(transport_options);
+  std::string wire, plain;
+  ASSERT_TRUE(codec.Encode(Request("normal", 83), wire));
+  auto client = listener.Client();
+  ASSERT_TRUE(client->WriteWithTimeout(wire, 1000));
+  ASSERT_TRUE(codec.Decode(ReadFrame(client), plain));
+  ASSERT_TRUE(client->WriteWithTimeout(wire, 1000));
+  const auto result = client->ReadWithTimeout(1000);
+  EXPECT_TRUE(result.eof || result.error);
+  EXPECT_EQ(result.bytes_received, 0u);
+}
+TEST(RpcClientNetworkTest,
+     CircuitBreakerAvoidsOpenInstanceAndRecoversAfterAProbe) {
+  // 对端第一次读取请求后关闭连接，第二次连接回送正常响应作为恢复探测。
+  Listener listener;
+  ClientConfigFile config(
+      listener.port,
+      {{"circuit_breaker",
+        {{"failure_threshold", 1}, {"reset_timeout_ms", 1000}}}});
+  RpcClient client(config.path.string());
+  std::atomic<int> accepts{0};
+  auto server = std::async(std::launch::async, [&] {
+    for (int i = 0; i < 2; ++i) {
+      pollfd pending{listener.fd.value, POLLIN, 0};
+      if (poll(&pending, 1, 5000) <= 0) return false;
+      auto peer = std::make_shared<Connection>(
+          accept(listener.fd.value, nullptr, nullptr));
+      ++accepts;
+      RpcRequest request;
+      if (!request.Deserialize(ReadFrame(peer))) return false;
+      if (i == 0) {
+        peer->Close();
+      } else {
+        RpcResponse response;
+        response.SetSequenceId(request.GetSequenceId());
+        response.SetResultData("\"recovered\"");
+        if (!peer->Write(response)) return false;
+      }
+    }
+    return true;
+  });
+  std::string response;
+  EXPECT_FALSE(client.Call("service", "Echo", std::string("first"),
+                           SerializeType::JSON, response));
+  EXPECT_FALSE(client.Call("service", "Echo", std::string("blocked"),
+                           SerializeType::JSON, response));
+  // 冷却期间连 TCP 建连都应跳过，不能仅在收发阶段拒绝。
+  EXPECT_EQ(accepts.load(), 1);
+  std::this_thread::sleep_for(1100ms);
+  EXPECT_TRUE(client.Call("service", "Echo", std::string("probe"),
+                          SerializeType::JSON, response));
+  EXPECT_EQ(response, "recovered");
+  EXPECT_EQ(accepts.load(), 2);
+  EXPECT_TRUE(server.get());
 }
 }  // namespace
 }  // namespace cookrpc

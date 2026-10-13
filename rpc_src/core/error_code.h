@@ -41,6 +41,7 @@ enum class ErrorCode : uint32_t {
   kServiceAlreadyExists = 3002,
   kInvalidServiceName = 3003,
   kServiceUnavailable = 3004,
+  kRateLimited = 3005,  // 配额耗尽属于请求拒绝，不代表实例不可通信。
 
   // 参数错误：4000-4999。
   kInvalidArgument = 4000,
@@ -83,6 +84,7 @@ class Error {
         {ErrorCode::kServiceAlreadyExists, "Service already exists"},
         {ErrorCode::kInvalidServiceName, "Invalid service name"},
         {ErrorCode::kServiceUnavailable, "Service unavailable"},
+        {ErrorCode::kRateLimited, "Request rate limit exceeded"},
         {ErrorCode::kInvalidArgument, "Invalid argument"},
         {ErrorCode::kArgumentOutOfRange, "Argument out of range"},
         {ErrorCode::kInvalidConfig, "Invalid configuration"},

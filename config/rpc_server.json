@@ -19,5 +19,14 @@
     "keep_alive_time": 60
   },
   "load_balance_strategy": "round",
-  "register_config": "../config/servers.json"
+  "register_config": "../config/servers.json",
+  "transport": {
+    "compression": true,
+    "compression_threshold": 1024,
+    "encryption": false
+  },
+  "rate_limit": {
+    "requests_per_second": 0,
+    "burst": 0
+  }
 }

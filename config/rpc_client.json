@@ -4,5 +4,14 @@
   "zk_namespace": "/cookrpc/cookrpc_service",
   "server_port": 8989,
   "timeout_ms": 3000,
-  "retry_times": 3
+  "retry_times": 3,
+  "transport": {
+    "compression": true,
+    "compression_threshold": 1024,
+    "encryption": false
+  },
+  "circuit_breaker": {
+    "failure_threshold": 5,
+    "reset_timeout_ms": 5000
+  }
 }

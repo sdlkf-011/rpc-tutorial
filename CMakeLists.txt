@@ -21,6 +21,8 @@ target_sources(rpc_common PRIVATE
     rpc_src/conn_balancer/load_balancer.cc
     rpc_src/conn_balancer/zk_conn_handler.cc
     rpc_src/core/rpc_client.cc
+    rpc_src/core/rpc_options.cc
+    rpc_src/core/request_controls.cc
     rpc_src/encrypt/aes_encrypt.cc
     rpc_src/load_config/registry_config.cc
     rpc_src/load_config/rpc_client_config.cc
@@ -31,6 +33,7 @@ target_sources(rpc_common PRIVATE
     rpc_src/network/create_socket.cc
     rpc_src/network/message_cycle.cc
     rpc_src/protocol/rpc_protocol.cc
+    rpc_src/protocol/transport_codec.cc
     rpc_src/registry/service_registry.cc
     rpc_src/thread_pool/thread_pool.cc
     rpc_src/thread_pool/thread_pool_singleton.cc

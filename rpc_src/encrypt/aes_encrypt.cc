@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "log_manager.h"
@@ -88,6 +89,15 @@ AesEncrypt::AesEncrypt() {
   }
 }
 
+AesEncrypt::AesEncrypt(const std::string& key_hex) {
+  // 独立密钥实例用于传输会话；构造失败时由配置加载器保留旧配置。
+  if (key_hex.find('\0') != std::string::npos ||
+      !DecodeMasterKey(key_hex.c_str(), master_key_))
+    throw std::invalid_argument(
+        "AES key must contain exactly 64 hexadecimal characters");
+  key_initialized_ = true;
+}
+
 AesEncrypt::~AesEncrypt() {
   // 对密钥内存做显式清零，降低进程退出前残留敏感数据的风险。
   OPENSSL_cleanse(master_key_.data(), master_key_.size());
@@ -149,7 +159,8 @@ std::string AesEncrypt::Base64Decode(const std::string& input) const {
   return output;
 }
 
-bool AesEncrypt::Encrypt(const std::string& data, std::string& ciphertext) {
+bool AesEncrypt::Encrypt(const std::string& data, std::string& ciphertext,
+                         const std::string& associated_data) const {
   ciphertext.clear();
   try {
     // 模块一：校验输入和运行时密钥状态。
@@ -157,7 +168,8 @@ bool AesEncrypt::Encrypt(const std::string& data, std::string& ciphertext) {
       LOG_ERROR("Input data is empty");
       return false;
     }
-    if (!key_initialized_ || data.size() > static_cast<size_t>(INT_MAX)) {
+    if (!key_initialized_ || data.size() > static_cast<size_t>(INT_MAX) ||
+        associated_data.size() > static_cast<size_t>(INT_MAX)) {
       LOG_ERROR("AES-256-GCM encryption key or input is invalid");
       return false;
     }
@@ -191,6 +203,13 @@ bool AesEncrypt::Encrypt(const std::string& data, std::string& ciphertext) {
       LOG_ERROR("Failed to authenticate the ciphertext version");
       return false;
     }
+    // 调用方可附加帧头和方向等元数据，防止仅修改外层字段绕过认证。
+    if (!associated_data.empty() &&
+        EVP_EncryptUpdate(
+            context.get(), nullptr, &output_size,
+            reinterpret_cast<const unsigned char*>(associated_data.data()),
+            static_cast<int>(associated_data.size())) != 1)
+      return false;
 
     std::string encrypted(data.size(), '\0');
     // 模块五：执行实际加密；GCM 通常不产生额外填充，输出长度不超过输入。
@@ -232,7 +251,8 @@ bool AesEncrypt::Encrypt(const std::string& data, std::string& ciphertext) {
 }
 
 bool AesEncrypt::Decrypt(const std::string& encrypted_data,
-                         std::string& plaintext) {
+                         std::string& plaintext,
+                         const std::string& associated_data) const {
   plaintext.clear();
   try {
     // 模块一：Base64 解码；失败时返回空字符串，后续格式校验会拒绝该输入。
@@ -241,6 +261,7 @@ bool AesEncrypt::Decrypt(const std::string& encrypted_data,
     // 模块二：验证版本，并确保 nonce、至少一个密文字节和认证标签完整存在。
     const size_t minimum_size = 1 + NONCE_LENGTH + 1 + TAG_LENGTH;
     if (!key_initialized_ || decoded.size() < minimum_size ||
+        associated_data.size() > static_cast<size_t>(INT_MAX) ||
         static_cast<unsigned char>(decoded.front()) != kCiphertextVersion) {
       LOG_ERROR("Invalid AES-256-GCM ciphertext format");
       return false;
@@ -280,6 +301,13 @@ bool AesEncrypt::Decrypt(const std::string& encrypted_data,
       LOG_ERROR("Failed to authenticate the ciphertext version");
       return false;
     }
+    // 解密端必须以相同顺序提供元数据，后续标签校验才会通过。
+    if (!associated_data.empty() &&
+        EVP_DecryptUpdate(
+            context.get(), nullptr, &output_size,
+            reinterpret_cast<const unsigned char*>(associated_data.data()),
+            static_cast<int>(associated_data.size())) != 1)
+      return false;
 
     plaintext.resize(encrypted_size);
     // 模块五：先解密得到候选明文；此时尚未确认其真实性，不能对外使用。

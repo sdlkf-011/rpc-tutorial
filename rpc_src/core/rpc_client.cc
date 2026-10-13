@@ -25,7 +25,7 @@
 #include "utils_fun.h"
 #include "zk_conn_handler.h"
 
-namespace cookrpc {
+namespace cookrpc::detail {
 namespace {
 
 // 协议帧与端口校验辅助函数：负责解析网络字节序字段并验证端口范围。
@@ -44,17 +44,17 @@ bool IsValidPort(int port) { return port > 0 && port <= 65535; }
 }  // namespace
 
 // 生命周期模块：构造时加载配置，析构时释放连接资源。
-RpcClient::RpcClient(const std::string& config_path)
+RpcClientSession::RpcClientSession(const std::string& config_path)
     : discovery_(std::make_unique<ZkConnHandler>()) {
   if (!LoadConfig(config_path)) {
     CLIENT_ERROR("Failed to initialize RPC client from {}", config_path);
   }
 }
 
-RpcClient::~RpcClient() { Disconnect(); }
+RpcClientSession::~RpcClientSession() { Disconnect(); }
 
 // 配置模块：读取客户端参数，校验取值，并初始化负载均衡和 ZooKeeper 服务发现。
-bool RpcClient::LoadConfig(const std::string& config_path) {
+bool RpcClientSession::LoadConfig(const std::string& config_path) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   try {
@@ -88,6 +88,11 @@ bool RpcClient::LoadConfig(const std::string& config_path) {
       return false;
     }
 
+    // 在切换发现会话前校验传输模式、密钥和熔断配置，失败保留当前会话。
+    auto transport = std::make_shared<TransportCodec>(TransportOptions::Parse(
+        config.value("transport", nlohmann::json::object())));
+    CircuitBreaker breaker(CircuitBreakerOptions::Parse(
+        config.value("circuit_breaker", nlohmann::json::object())));
     // 先初始化服务发现，成功后再提交客户端配置，避免留下半初始化状态。
     if (!discovery_->InitZkConnHandler(config)) {
       CLIENT_ERROR("Failed to initialize ZooKeeper service discovery");
@@ -99,6 +104,8 @@ bool RpcClient::LoadConfig(const std::string& config_path) {
     }
 
     DisconnectUnlocked();
+    transport_ = std::move(transport);
+    breaker_ = std::move(breaker);
     timeout_ms_ = timeout_ms;
     retry_times_ = retry_times;
     default_server_port_ = server_port;
@@ -114,13 +121,13 @@ bool RpcClient::LoadConfig(const std::string& config_path) {
   return false;
 }
 
-bool RpcClient::Connect() {
+bool RpcClientSession::Connect() {
   std::lock_guard<std::mutex> lock(mutex_);
   return ConnectUnlocked();
 }
 
 // 连接建立模块：每次重试重新发现服务并创建套接字，避免复用失败的文件描述符。
-bool RpcClient::ConnectUnlocked() {
+bool RpcClientSession::ConnectUnlocked() {
   if (!is_configured_) {
     CLIENT_ERROR("RPC client is not configured");
     return false;
@@ -148,6 +155,7 @@ bool RpcClient::ConnectUnlocked() {
         auto connection = std::make_shared<Connection>(fd);
         fd = -1;
         if (connection->IsValid()) {
+          endpoint_ = server_address;
           socket_fd_ = connection->GetFd();
           connection_ = std::move(connection);
           pending_response_data_.clear();
@@ -159,6 +167,7 @@ bool RpcClient::ConnectUnlocked() {
       if (fd >= 0) {
         close(fd);
       }
+      breaker_.Finish(server_address, CircuitBreaker::Outcome::kFailure);
     }
 
     if (attempt < maximum_attempts) {
@@ -172,12 +181,12 @@ bool RpcClient::ConnectUnlocked() {
   return false;
 }
 
-void RpcClient::Disconnect() {
+void RpcClientSession::Disconnect() {
   std::lock_guard<std::mutex> lock(mutex_);
   DisconnectUnlocked();
 }
 
-void RpcClient::DisconnectUnlocked() {
+void RpcClientSession::DisconnectUnlocked() {
   // 先标记不可用并清空残留字节，防止旧响应被下一次调用误读。
   is_connected_.store(false, std::memory_order_release);
   pending_response_data_.clear();
@@ -191,12 +200,12 @@ void RpcClient::DisconnectUnlocked() {
 }
 
 // 重连与健康检查模块：发现连接失效时清理旧状态并重新执行服务发现和建连。
-bool RpcClient::Reconnect() {
+bool RpcClientSession::Reconnect() {
   DisconnectUnlocked();
   return ConnectUnlocked();
 }
 
-bool RpcClient::CheckConnection() {
+bool RpcClientSession::CheckConnection() {
   if (is_connected_.load(std::memory_order_acquire) && connection_ != nullptr &&
       connection_->IsValid()) {
     return true;
@@ -205,18 +214,27 @@ bool RpcClient::CheckConnection() {
   return Reconnect();
 }
 
-std::string RpcClient::GetServerAddress() const {
+std::string RpcClientSession::GetServerAddress() {
   if (zk_namespace_.empty()) {
     return {};
   }
-  return discovery_->GetServer(zk_namespace_);
+  auto endpoints = discovery_->GetAllServers(zk_namespace_);
+  // 空结果可能来自发现故障，不据此清空历史；有效快照才清理失效实例。
+  if (!endpoints.empty()) breaker_.ForgetMissing(endpoints);
+  // 先避开仍在冷却或探测中的实例，再让负载均衡器选择可用地址。
+  endpoints.erase(std::remove_if(endpoints.begin(), endpoints.end(),
+                                 [this](const std::string& endpoint) {
+                                   return !breaker_.Available(endpoint);
+                                 }),
+                  endpoints.end());
+  return LoadBalancer::SelectServer(endpoints);
 }
 
 // 服务发现与地址解析模块：从注册中心获取地址，并兼容“IPv4:端口”和仅 IPv4
 // 两种格式。
-bool RpcClient::ParseServerAddress(const std::string& server_address,
-                                   std::string& server_ip,
-                                   uint16_t& server_port) const {
+bool RpcClientSession::ParseServerAddress(const std::string& server_address,
+                                          std::string& server_ip,
+                                          uint16_t& server_port) const {
   if (server_address.empty()) {
     return false;
   }
@@ -253,7 +271,7 @@ bool RpcClient::ParseServerAddress(const std::string& server_address,
 
 // Socket 初始化模块：创建 IPv4 TCP 套接字，设置非阻塞、
 // close-on-exec、低延迟和保活选项。
-bool RpcClient::InitSocket(int& fd) const {
+bool RpcClientSession::InitSocket(int& fd) const {
   fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     CLIENT_ERROR("Failed to create client socket: {}", std::strerror(errno));
@@ -294,8 +312,8 @@ bool RpcClient::InitSocket(int& fd) const {
 }
 
 // 非阻塞连接模块：先发起异步 connect，再通过 poll 统一实现连接超时和错误检查。
-bool RpcClient::TryConnect(int fd, const std::string& server_ip,
-                           uint16_t server_port, int attempt) const {
+bool RpcClientSession::TryConnect(int fd, const std::string& server_ip,
+                                  uint16_t server_port, int attempt) const {
   sockaddr_in server_address{};
   server_address.sin_family = AF_INET;
   server_address.sin_port = htons(server_port);
@@ -317,7 +335,7 @@ bool RpcClient::TryConnect(int fd, const std::string& server_ip,
   return false;
 }
 
-bool RpcClient::WaitForConnection(int fd, int attempt) const {
+bool RpcClientSession::WaitForConnection(int fd, int attempt) const {
   pollfd descriptor{};
   descriptor.fd = fd;
   descriptor.events = POLLOUT;
@@ -362,7 +380,7 @@ bool RpcClient::WaitForConnection(int fd, int attempt) const {
 }
 
 // 请求标识模块：以原子计数器生成非零序列号，用于匹配请求和响应。
-uint32_t RpcClient::GenerateSequenceId() {
+uint32_t RpcClientSession::GenerateSequenceId() {
   uint32_t sequence_id =
       sequence_id_.fetch_add(1, std::memory_order_relaxed) + 1;
   if (sequence_id == 0) {
@@ -373,9 +391,17 @@ uint32_t RpcClient::GenerateSequenceId() {
 }
 
 // 请求发送模块：生成的完整请求帧交给 Connection，后者负责短写和 SIGPIPE 处理。
-bool RpcClient::SendRequest(const std::string& request_frame) {
+bool RpcClientSession::SendRequest(const std::string& request_frame) {
+  std::string wire;
+  // 发送前完成传输变换，编码超限属于本地失败，不影响实例健康计数。
+  if (!transport_->Encode(request_frame, wire)) {
+    CLIENT_ERROR(
+        "Failed to encode RPC request; check the transport size limit");
+    return false;
+  }
   if (connection_ == nullptr ||
-      !connection_->WriteWithTimeout(request_frame, timeout_ms_)) {
+      !connection_->WriteWithTimeout(wire, timeout_ms_)) {
+    remote_failure_ = true;
     CLIENT_ERROR("Failed to send RPC request");
     if (connection_ == nullptr || !connection_->IsValid()) {
       DisconnectUnlocked();
@@ -386,7 +412,7 @@ bool RpcClient::SendRequest(const std::string& request_frame) {
 }
 
 // 响应接收与拆帧模块：累积 TCP 字节流，校验协议头，并按声明长度提取完整响应帧。
-bool RpcClient::ReadResponseFrame(std::string& response_frame) {
+bool RpcClientSession::ReadResponseFrame(std::string& response_frame) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms_);
 
@@ -399,7 +425,7 @@ bool RpcClient::ReadResponseFrame(std::string& response_frame) {
           ReadNetworkUint32(pending_response_data_.data());
       const uint32_t body_size =
           ReadNetworkUint32(pending_response_data_.data() + sizeof(uint32_t));
-      if (magic_number != RpcHeader::MAGIC ||
+      if (!TransportCodec::IsMagic(magic_number) ||
           body_size > Connection::MAX_MESSAGE_SIZE) {
         CLIENT_ERROR("Received an invalid RPC response frame");
         DisconnectUnlocked();
@@ -409,8 +435,14 @@ bool RpcClient::ReadResponseFrame(std::string& response_frame) {
       const size_t frame_size = kHeaderSize + static_cast<size_t>(body_size);
       if (pending_response_data_.size() >= frame_size) {
         // 提取一帧并保留后续字节，支持一次 read 收到多帧的情况。
-        response_frame.assign(pending_response_data_.data(), frame_size);
+        const std::string wire(pending_response_data_.data(), frame_size);
         pending_response_data_.erase(0, frame_size);
+        // 认证和解压通过后才交给响应解析器，错误帧不能进入业务反序列化。
+        if (!transport_->Decode(wire, response_frame)) {
+          CLIENT_ERROR("RPC transport decoding or authentication failed");
+          DisconnectUnlocked();
+          return false;
+        }
         if (terminal || (connection_ && connection_->HasReadEof()))
           DisconnectUnlocked();
         return true;
@@ -463,4 +495,4 @@ bool RpcClient::ReadResponseFrame(std::string& response_frame) {
   }
 }
 
-}  // namespace cookrpc
+}  // namespace cookrpc::detail

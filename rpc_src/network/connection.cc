@@ -49,7 +49,11 @@ uint32_t ReadNetworkUint32(const char* data) {
 }
 }  // namespace
 
-Connection::Connection(int fd) : fd_(fd), id_(next_connection_id.fetch_add(1)) {
+Connection::Connection(int fd, std::shared_ptr<const TransportCodec> transport)
+    : fd_(fd),
+      transport_(transport ? std::move(transport)
+                           : std::make_shared<TransportCodec>()),
+      id_(next_connection_id.fetch_add(1)) {
   // 连接初始化模块：配置非阻塞属性，读取对端地址并进入已连接状态。
   if (fd_ < 0) {
     return;
@@ -132,7 +136,7 @@ Connection::ReadResult Connection::Read() {
   while (result.bytes_received < kReadBudget) {
     size_t capacity =
         std::min(sizeof(buffer), kReadBudget - result.bytes_received);
-    if (!message_callback_) {
+    if (!message_callback_ && !frame_callback_) {
       capacity =
           std::min(capacity, RpcHeader::kMaxFrameSize - read_buffer_.size());
       if (capacity == 0) return result;
@@ -141,7 +145,7 @@ Connection::ReadResult Connection::Read() {
     if (received > 0) {
       result.bytes_received += static_cast<size_t>(received);
       read_buffer_.insert(read_buffer_.end(), buffer, buffer + received);
-      if (message_callback_ && !ProcessMessage()) {
+      if ((message_callback_ || frame_callback_) && !ProcessMessage()) {
         result.error = true;
         return result;
       }
@@ -242,11 +246,28 @@ bool Connection::Write(const std::string& data) {
     error.SetErrorCode(static_cast<uint32_t>(ErrorCode::kProtocolError));
     error.SetErrorMessage("RPC response exceeds the 1 MiB body limit");
     std::string frame;
-    return error.SerializeForSend(frame) && QueueFrame(std::move(frame));
+    return error.SerializeForSend(frame) && QueueResponse(frame);
   }
   RpcResponse response;
   // 原始帧入口也必须遵守协议长度与字段校验，不允许绕过响应检查。
-  return response.Deserialize(data) && QueueFrame(data);
+  return response.Deserialize(data) && QueueResponse(data);
+}
+
+bool Connection::QueueResponse(const std::string& plain) {
+  std::string wire;
+  if (!transport_->Encode(plain, wire)) {
+    // 加密膨胀也可能让合法业务帧超限；错误帧仍使用相同编码器和序列号。
+    RpcResponse response;
+    response.SetSequenceId(ReadNetworkUint32(plain.data() + 8));
+    response.SetErrorCode(static_cast<uint32_t>(ErrorCode::kProtocolError));
+    response.SetErrorMessage(
+        "Encoded RPC response exceeds the transport limit");
+    std::string fallback;
+    if (!response.SerializeForSend(fallback) ||
+        !transport_->Encode(fallback, wire))
+      return false;
+  }
+  return QueueFrame(std::move(wire));
 }
 
 bool Connection::Write(const RpcResponse& response) {
@@ -353,7 +374,8 @@ bool Connection::ProcessMessage() {
     const uint32_t magic_number = ReadNetworkUint32(read_buffer_.data());
     const uint32_t body_size =
         ReadNetworkUint32(read_buffer_.data() + sizeof(uint32_t));
-    if (magic_number != RpcHeader::MAGIC || body_size > MAX_MESSAGE_SIZE) {
+    if (!TransportCodec::IsMagic(magic_number) ||
+        body_size > MAX_MESSAGE_SIZE) {
       LOG_ERROR("Invalid RPC frame from {}:{}", peer_addr_, peer_port_);
       HandleError();
       return false;
@@ -366,18 +388,36 @@ bool Connection::ProcessMessage() {
     }
 
     std::string frame(read_buffer_.data(), frame_size);
-    RpcRequest request;
-    if (!request.Deserialize(frame)) {
-      HandleError();
-      return false;
+    if (transport_->Encrypted()) {
+      // 用无符号差值判断顺序，允许正常计数回绕并拒绝重复、倒退请求。
+      // 此处仅限制当前连接；工作线程仍须认证帧头，不能替代跨连接防重放。
+      const uint32_t sequence = ReadNetworkUint32(frame.data() + 8);
+      const uint32_t distance = sequence - last_request_sequence_;
+      if (sequence == 0 || (received_encrypted_request_ &&
+                            (distance == 0 || distance > INT32_MAX))) {
+        HandleError();
+        return false;
+      }
+      last_request_sequence_ = sequence;
+      received_encrypted_request_ = true;
     }
 
     // 先移除完整帧再调用业务回调，回调可以安全地关闭当前连接。
     read_buffer_.erase(
         read_buffer_.begin(),
         read_buffer_.begin() + static_cast<ptrdiff_t>(frame_size));
-    // 先从缓冲移除当前帧，再回调业务，允许回调安全关闭连接。
-    HandleMessage(request);
+    if (frame_callback_) {
+      // 服务端在事件线程中仅拆帧，耗时的传输解码由工作线程完成。
+      frame_callback_(shared_from_this(), std::move(frame));
+    } else {
+      std::string plain;
+      RpcRequest request;
+      if (!transport_->Decode(frame, plain) || !request.Deserialize(plain)) {
+        HandleError();
+        return false;
+      }
+      HandleMessage(request);
+    }
     if (!IsValid()) {
       return false;
     }

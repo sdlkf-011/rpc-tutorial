@@ -10,6 +10,7 @@
 
 namespace cookrpc {
 namespace {
+// 每次从有效配置开始，非法候选配置必须保持整份已提交配置不变。
 class ServerConfigTest : public testing::Test {
  protected:
   RpcServerConfig& config = RpcServerConfig::GetInstance();
@@ -146,6 +147,29 @@ TEST_F(ServerConfigTest,
     EXPECT_EQ(registry.GetServiceName(), "B");
     ASSERT_EQ(registry.GetRegistryNodesSize(), 1u);
     EXPECT_EQ(registry.GetRegistryNodes()[0].port, 8990);
+  }
+}
+
+TEST_F(ServerConfigTest,
+       InvalidRuntimeOptionsPreserveCommittedTransportAndLimiter) {
+  // 候选配置同时修改监听端口，验证运行选项失败不会造成部分字段提交。
+  auto good = Good();
+  good["transport"] = {{"compression", true}, {"compression_threshold", 256}};
+  good["rate_limit"] = {{"requests_per_second", 2}, {"burst", 3}};
+  ASSERT_TRUE(Load(good));
+  for (const auto& invalid :
+       {nlohmann::json{{"transport", {{"encryption", 1}}}},
+        nlohmann::json{
+            {"rate_limit", {{"requests_per_second", 2}, {"burst", 0}}}}}) {
+    auto candidate = good;
+    candidate.update(invalid);
+    candidate["servers_port"] = 8990;
+    EXPECT_FALSE(Load(candidate));
+    EXPECT_EQ(config.GetServersPort(), 8989);
+    EXPECT_TRUE(config.GetTransportOptions().compression);
+    EXPECT_EQ(config.GetTransportOptions().compression_threshold, 256u);
+    EXPECT_EQ(config.GetRateLimitOptions().requests_per_second, 2);
+    EXPECT_EQ(config.GetRateLimitOptions().burst, 3);
   }
 }
 }  // namespace
