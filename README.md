@@ -304,32 +304,47 @@ TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure
 
 ## 压力测试
 
-ZooKeeper 和 RPC 服务均已就绪时：
+先启动 ZooKeeper 和 RPC 服务端，再从仓库根目录运行脚本。
+
+默认使用 10 个并发客户端，每个发送 100 个请求，共 1000 个请求：
 
 ```bash
-./stress_test.sh --threads 8 --requests 50000 --payload-size 256
+./stress_test.sh
 ```
 
-让脚本管理本地服务端的启动与清理：
+50 个并发客户端，每个发送 200 个请求，共 10000 个请求：
 
 ```bash
-./stress_test.sh --start-server --threads 8 --requests 50000
+./stress_test.sh -c 50 -r 200
 ```
 
-使用 `--build` 可先构建。配置、构建目录和服务端日志路径均在切换目录前按调用者工作目录规范化，支持带空格的路径；例如：
+20 个并发客户端，持续测试 120 秒：
 
 ```bash
-./stress_test.sh --build-dir './out build' \
-  --client-config './my configs/client.json' \
-  --server-config './my configs/server.json' \
-  --server-log './test logs/server.log' --start-server
+./stress_test.sh -c 20 -t 120
 ```
 
-脚本从仓库根目录运行子进程，RPC 文件日志写入 `logs/`。`--server-log` 指定服务端控制台输出文件，默认位于所选构建目录的 `stress_test_server.log`。
+| 参数 | 含义 | 默认值 |
+| --- | --- | --- |
+| `-c N` / `--threads N` | 并发客户端数，范围 1–1024 | `10` |
+| `-r N` / `--requests-per-client N` | 每个客户端发送的请求数，合计最多 1000 万 | `100` |
+| `-t N` / `--duration N` | 测试时长，单位秒，范围 1–86400 | 按请求数测试 |
+| `--payload-size N` | 每次 Echo 的消息字节数 | `64` |
+| `-h` / `--help` | 查看全部选项 | — |
 
-压测使用多个独立客户端与长连接，并发调用 `RpcService.Echo`，校验返回消息，输出成功率、吞吐量、平均延迟及 P50/P95/P99。连接准备不计入测试窗口；延迟样本包含成功与失败调用。错误类型、缺失字段和不匹配的 Echo 值均计为失败，压测返回非零状态。具体参数与环境变量见 `./stress_test.sh --help`。
+`-r` 与 `-t` 不能同时使用。连接准备完成后开始计时，到期停止发起新请求，等待在途调用完成后输出结果。报告包含请求数、成功率、吞吐量、平均延迟及 P50/P95/P99；时长模式采用固定大小延迟直方图，百分位为近似值，平均与最大延迟按全部调用统计。请求失败时返回非零退出码。
 
-脚本跟踪自己启动的构建、客户端和服务端进程组；`SIGINT` 与 `SIGTERM` 分别返回 130、143，并清理这些进程及其子进程。停止宽限期默认 10 秒，可通过 `--shutdown-timeout` 或 `SHUTDOWN_TIMEOUT_SECONDS` 设置为 1–60 秒；宽限期后仍未退出的进程会被强制结束，可能中止在途请求。
+原有 `--requests N` 仍表示所有客户端合计的请求数，与 `-r`、`-t` 互斥；例如 `./stress_test.sh --threads 8 --requests 50000`。
+
+需要脚本管理服务端时，加上 `--start-server`；需要先编译时，加上 `--build`：
+
+```bash
+./stress_test.sh --start-server -c 50 -r 200
+```
+
+通过 `--client-config`、`--server-config`、`--build-dir` 和 `--server-log` 指定其他配置与目录。相对路径按调用者工作目录解析，支持包含空格的路径。脚本从仓库根目录运行子进程，RPC 文件日志写入 `logs/`；服务端控制台输出默认保存到构建目录的 `stress_test_server.log`。
+
+脚本只清理自己创建的进程组。`Ctrl+C` 返回 `130`，`SIGTERM` 返回 `143`，停止宽限期默认 10 秒，可通过 `--shutdown-timeout` 设置为 1–60 秒。更多选项与环境变量见 `./stress_test.sh --help`。
 
 ## 项目结构
 

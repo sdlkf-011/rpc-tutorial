@@ -75,7 +75,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 --client "$<TARGET_FILE:rpc_client>"
                 --stress-client "$<TARGET_FILE:stress_test_client>"
                 --config-dir "${PROJECT_SOURCE_DIR}/config"
-                --zk-launcher "${PROJECT_SOURCE_DIR}/zk_start.sh")
+                --zk-launcher "${PROJECT_SOURCE_DIR}/zk_start.sh"
+                --stress-script "${PROJECT_SOURCE_DIR}/stress_test.sh")
         set_tests_properties(startup_regression PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endif()
 endif()

@@ -9,8 +9,12 @@ PROJECT_ROOT="$(realpath -m -- "$(dirname "${BASH_SOURCE[0]}")")"
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
 CLIENT_CONFIG="${CLIENT_CONFIG:-${PROJECT_ROOT}/config/rpc_client.json}"
 SERVER_CONFIG="${SERVER_CONFIG:-${PROJECT_ROOT}/config/rpc_server.json}"
-THREADS="${THREADS:-4}"
-REQUESTS="${REQUESTS:-10000}"
+THREADS="${THREADS:-10}"
+REQUESTS_PER_CLIENT="${REQUESTS_PER_CLIENT:-100}"
+REQUESTS="${REQUESTS:-}"
+DURATION="${DURATION:-}"
+REQUEST_MODE="per-client"
+CLI_REQUEST_MODE=""
 PAYLOAD_SIZE="${PAYLOAD_SIZE:-64}"
 BUILD_FIRST="${BUILD_FIRST:-0}"
 START_SERVER="${START_SERVER:-0}"
@@ -26,23 +30,31 @@ usage() {
 Usage: ./stress_test.sh [options]
 
 Options:
+  -c N, --threads N      Concurrent client connections (default: 10)
+  -r N, --requests-per-client N
+                        Requests per client (default: 100)
+  -t N, --duration N     Run for N seconds (mutually exclusive with -r)
   --build                Build the project before running the test
   --start-server         Start and stop a local rpc_server for this test
-  --threads N            Concurrent client connections (default: 4)
-  --requests N           Total requests (default: 10000)
+  --requests N           Total requests across all clients (legacy mode)
   --payload-size N       Echo message size in bytes (default: 64)
   --client-config PATH   RPC client config file
   --server-config PATH   RPC server config file used with --start-server
   --build-dir PATH       Build directory (default: project build/)
   --server-log PATH      Server console output used with --start-server
   --shutdown-timeout N   Grace period before killing owned processes (1-60 seconds; default: 10)
-  --help                 Show this help message
+  -h, --help             Show this help message
+
+Examples:
+  ./stress_test.sh                  10 clients, 100 requests each
+  ./stress_test.sh -c 50 -r 200      50 clients, 10000 total requests
+  ./stress_test.sh -c 20 -t 120      20 clients, run for 120 seconds
 
 The script requires a running ZooKeeper. Without --start-server, the RPC
 service must already be running and registered. Child programs run from the
 project root and write RPC file logs to logs/. Relative CLI paths are resolved
 from the caller's directory. Parameters can also be set with BUILD_DIR,
-BUILD_FIRST, START_SERVER, THREADS, REQUESTS,
+BUILD_FIRST, START_SERVER, THREADS, REQUESTS_PER_CLIENT, REQUESTS, DURATION,
 PAYLOAD_SIZE, CLIENT_CONFIG, SERVER_CONFIG, SERVER_LOG, and SHUTDOWN_TIMEOUT_SECONDS
 environment variables.
 EOF
@@ -62,7 +74,19 @@ require_value() {
   fi
 }
 
-# 参数解析模块：保留简单稳定的长选项接口，数值范围由压测客户端统一校验。
+select_request_mode() {
+  [[ -z "${CLI_REQUEST_MODE}" || "${CLI_REQUEST_MODE}" == "$1" ]] ||
+    fail "-r/--requests-per-client, -t/--duration and --requests are mutually exclusive"
+  CLI_REQUEST_MODE="$1"
+  REQUEST_MODE="$1"
+}
+
+[[ -z "${REQUESTS}" || -z "${DURATION}" ]] ||
+  fail "REQUESTS and DURATION cannot both be set"
+if [[ -n "${REQUESTS}" ]]; then REQUEST_MODE="total"; fi
+if [[ -n "${DURATION}" ]]; then REQUEST_MODE="duration"; fi
+
+# 命令行覆盖环境默认值；三种请求模式不能在同一次命令中混用。
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build)
@@ -73,14 +97,27 @@ while [[ $# -gt 0 ]]; do
       START_SERVER=1
       shift
       ;;
-    --threads)
+    -c|--threads)
       require_value "$@"
       THREADS="$2"
       shift 2
       ;;
     --requests)
       require_value "$@"
+      select_request_mode total
       REQUESTS="$2"
+      shift 2
+      ;;
+    -r|--requests-per-client)
+      require_value "$@"
+      select_request_mode per-client
+      REQUESTS_PER_CLIENT="$2"
+      shift 2
+      ;;
+    -t|--duration)
+      require_value "$@"
+      select_request_mode duration
+      DURATION="$2"
       shift 2
       ;;
     --payload-size)
@@ -113,7 +150,7 @@ while [[ $# -gt 0 ]]; do
       SHUTDOWN_TIMEOUT_SECONDS="$2"
       shift 2
       ;;
-    --help)
+    -h|--help)
       usage
       exit 0
       ;;
@@ -122,6 +159,33 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+validate_integer() {
+  [[ "$2" =~ ^[0-9]{1,8}$ ]] || fail "$1 must be an integer between 1 and $3"
+  local value=$((10#$2))
+  (( value >= 1 && value <= $3 )) || fail "$1 must be an integer between 1 and $3"
+}
+validate_integer "concurrency" "${THREADS}" 1024
+THREADS=$((10#${THREADS}))
+case "${REQUEST_MODE}" in
+  per-client)
+    validate_integer "requests per client" "${REQUESTS_PER_CLIENT}" 10000000
+    REQUESTS_PER_CLIENT=$((10#${REQUESTS_PER_CLIENT}))
+    (( THREADS * REQUESTS_PER_CLIENT <= 10000000 )) || fail "total requests must not exceed 10000000"
+    REQUEST_ARGS=(--requests-per-client "${REQUESTS_PER_CLIENT}")
+    REQUEST_DESCRIPTION="requests/client=${REQUESTS_PER_CLIENT}, total=$((THREADS * REQUESTS_PER_CLIENT))"
+    ;;
+  total)
+    validate_integer "total requests" "${REQUESTS}" 10000000
+    REQUEST_ARGS=(--requests "${REQUESTS}")
+    REQUEST_DESCRIPTION="total requests=${REQUESTS}"
+    ;;
+  duration)
+    validate_integer "duration" "${DURATION}" 86400
+    REQUEST_ARGS=(--duration "${DURATION}")
+    REQUEST_DESCRIPTION="duration=${DURATION}s"
+    ;;
+esac
 
 [[ "${SHUTDOWN_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]?$ ]] &&
   (( SHUTDOWN_TIMEOUT_SECONDS <= 60 )) || fail "shutdown timeout must be an integer between 1 and 60"
@@ -216,13 +280,13 @@ if [[ "${START_SERVER}" == "1" ]]; then
 fi
 
 # 压测执行模块：统一从仓库根目录运行，使日志位于项目的 logs/。
-echo "Running stress test: threads=${THREADS}, requests=${REQUESTS}, payload=${PAYLOAD_SIZE} bytes"
+echo "Running stress test: clients=${THREADS}, ${REQUEST_DESCRIPTION}, payload=${PAYLOAD_SIZE} bytes"
 (
   cd "${PROJECT_ROOT}"
   exec setsid "${BUILD_DIR}/stress_test_client" \
     --config "${CLIENT_CONFIG}" \
     --threads "${THREADS}" \
-    --requests "${REQUESTS}" \
+    "${REQUEST_ARGS[@]}" \
     --payload-size "${PAYLOAD_SIZE}"
 ) &
 CLIENT_PID=$!

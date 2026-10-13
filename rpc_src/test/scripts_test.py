@@ -19,7 +19,8 @@ class ScriptTests(unittest.TestCase):
         self.env = os.environ.copy()
         for key in ("BUILD_DIR", "BUILD_FIRST", "START_SERVER", "SERVER_LOG", "CLIENT_CONFIG", "SERVER_CONFIG",
                     "VCPKG_ROOT", "VCPKG_TARGET_TRIPLET", "VCPKG_DEFAULT_TRIPLET", "CMAKE_TOOLCHAIN_FILE",
-                    "SHUTDOWN_TIMEOUT_SECONDS", "ZOOKEEPER_HOME", "ZK_SERVER_CLASSPATH"):
+                    "SHUTDOWN_TIMEOUT_SECONDS", "ZOOKEEPER_HOME", "ZK_SERVER_CLASSPATH",
+                    "THREADS", "REQUESTS", "REQUESTS_PER_CLIENT", "DURATION", "PAYLOAD_SIZE"):
             self.env.pop(key, None)
 
     def program(self, path, code):
@@ -114,6 +115,54 @@ assert path.is_absolute() and path.read_text() == '{}'
         self.env.update(BUILD_DIR="build", CLIENT_CONFIG="client.json")
         result = self.run_script("stress_test.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_stress_short_options_defaults_and_legacy_modes(self):
+        build = self.work / 'stress modes'
+        config = self.work / 'client.json'; config.write_text('{}')
+        trace = self.work / 'stress-argv.json'
+        self.program(build / 'stress_test_client', """import json, os, pathlib, sys
+pathlib.Path(os.environ['TRACE']).write_text(json.dumps(sys.argv[1:]))
+""")
+        self.env['TRACE'] = str(trace)
+        cases = [
+            ([], {}, '10', '--requests-per-client', '100'),
+            (['-c', '50', '-r', '200'], {}, '50', '--requests-per-client', '200'),
+            (['-c', '20', '-t', '120'], {}, '20', '--duration', '120'),
+            (['--threads', '8', '--requests', '50000'], {}, '8', '--requests', '50000'),
+            ([], {'THREADS': '3', 'REQUESTS_PER_CLIENT': '7'}, '3', '--requests-per-client', '7'),
+            ([], {'REQUESTS': '12'}, '10', '--requests', '12'),
+            ([], {'DURATION': '2'}, '10', '--duration', '2'),
+            (['-r', '4'], {'DURATION': '2'}, '10', '--requests-per-client', '4'),
+        ]
+        for args, overrides, clients, mode, value in cases:
+            with self.subTest(args=args, env=overrides):
+                env = self.env.copy(); env.update(overrides)
+                result = self.run_script('stress_test.sh',
+                    ['--build-dir', str(build), '--client-config', str(config), *args], env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                argv = json.loads(trace.read_text())
+                self.assertEqual(argv[argv.index('--threads') + 1], clients)
+                self.assertEqual(argv[argv.index(mode) + 1], value)
+                self.assertEqual(sum(flag in argv for flag in
+                    ('--duration', '--requests', '--requests-per-client')), 1)
+
+    def test_stress_rejects_invalid_or_conflicting_modes_before_starting_processes(self):
+        build = self.work / 'invalid modes'
+        trace = self.work / 'started'
+        self.program(build / 'stress_test_client',
+                     f'from pathlib import Path\nPath({str(trace)!r}).touch()\n')
+        cases = [
+            ['-r', '2', '-t', '1'], ['-t', '1', '-r', '2'],
+            ['--requests', '10', '-r', '2'], ['--requests', '10', '-t', '1'],
+            ['-c', '0'], ['-c', '1025'], ['-c', '-1'], ['-r', '1.5'],
+            ['-r', '0'], ['-r', '999999999999999999999'],
+            ['-c', '1024', '-r', '10000'], ['-t', '0'], ['-t', '86401'],
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                result = self.run_script('stress_test.sh', ['--build-dir', str(build), *args])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(trace.exists(), 'invalid arguments started a client')
 
     def test_stress_cancellation_stops_owned_process_groups_and_reports_signal(self):
         for sig, ignored in ((signal.SIGTERM, False), (signal.SIGINT, False),

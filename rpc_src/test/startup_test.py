@@ -21,6 +21,7 @@ def main():
     parser.add_argument('--stress-client', type=Path, required=True)
     parser.add_argument('--config-dir', type=Path, required=True)
     parser.add_argument('--zk-launcher', type=Path, required=True)
+    parser.add_argument('--stress-script', type=Path, required=True)
     args = parser.parse_args()
     classpath = os.environ.get(
         'ZK_SERVER_CLASSPATH',
@@ -40,6 +41,7 @@ def main():
         for binary in (args.server, args.client, args.stress_client):
             shutil.copy2(binary, build / binary.name)
         shutil.copy2(args.zk_launcher, project / 'zk_start.sh')
+        shutil.copy2(args.stress_script, project / 'stress_test.sh')
         keeper = ZooKeeper(keeper_dir, classpath)
         server = None
         try:
@@ -63,6 +65,7 @@ def main():
                 zoo_config.replace('clientPort=2181', f'clientPort={keeper.port}'))
             env = os.environ.copy()
             env['ZK_SERVER_CLASSPATH'] = classpath
+            env['JAVA_TOOL_OPTIONS'] = '-Dzookeeper.nio.numWorkerThreads=4'
             keeper.start(command=['./zk_start.sh'], cwd=project, env=env)
             log_path = project / 'server.log'
             with log_path.open('w') as log:
@@ -87,6 +90,25 @@ def main():
                     cwd=project, capture_output=True, text=True, timeout=15)
                 assert result.returncode == 0, result.stdout + result.stderr
                 assert 'Successful        : 2' in result.stdout, result.stdout
+                # 直接运行用户的脚本入口，验证次数模式和时长模式完整调用链。
+                stress_env = os.environ.copy()
+                for key in ('BUILD_DIR', 'BUILD_FIRST', 'START_SERVER', 'SERVER_LOG',
+                            'CLIENT_CONFIG', 'SERVER_CONFIG', 'THREADS', 'REQUESTS',
+                            'REQUESTS_PER_CLIENT', 'DURATION', 'PAYLOAD_SIZE'):
+                    stress_env.pop(key, None)
+                for cli_args, expected_count in (
+                        ([], 1000),
+                        (['-c', '50', '-r', '200'], 10000),
+                        (['-c', '20', '-t', '1'], None)):
+                    result = subprocess.run(['./stress_test.sh', *cli_args], cwd=project,
+                        env=stress_env, capture_output=True, text=True, timeout=30)
+                    assert result.returncode == 0, result.stdout + result.stderr
+                    assert 'Failed            : 0' in result.stdout, result.stdout
+                    if expected_count is not None:
+                        assert f'Completed requests: {expected_count}' in result.stdout, result.stdout
+                    else:
+                        assert 'Duration target   : 1 s' in result.stdout, result.stdout
+                    print(f'PASS: stress script {cli_args or "defaults"}')
             assert list((project / 'logs').glob('cookrpc_*.log')), 'Missing project logs'
         finally:
             try:
