@@ -218,9 +218,10 @@ std::string RpcClientSession::GetServerAddress() {
   if (zk_namespace_.empty()) {
     return {};
   }
-  auto endpoints = discovery_->GetAllServers(zk_namespace_);
-  // 空结果可能来自发现故障，不据此清空历史；有效快照才清理失效实例。
-  if (!endpoints.empty()) breaker_.ForgetMissing(endpoints);
+  auto snapshot = discovery_->GetAllServersSnapshot(zk_namespace_);
+  auto& endpoints = snapshot.servers;
+  // 部分读取失败不能证明节点消失；完整的成功空目录则可以清理全部历史。
+  if (snapshot.complete) breaker_.ForgetMissing(endpoints);
   // 先避开仍在冷却或探测中的实例，再让负载均衡器选择可用地址。
   endpoints.erase(std::remove_if(endpoints.begin(), endpoints.end(),
                                  [this](const std::string& endpoint) {

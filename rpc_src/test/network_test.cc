@@ -23,16 +23,26 @@
 
 #include "connection.h"
 #include "connection_manager.h"
+#include "message.pb.h"
 #include "message_cycle.h"
 #include "rpc_client.h"
 #include "service_manager.h"
 #include "thread_pool_singleton.h"
+#include "zk_conn_handler.h"
 
 namespace {
 using namespace std::chrono_literals;
 std::atomic<int> discovered_port{0};
 std::mutex discovery_data_mutex;
 std::string discovery_address_override;
+struct DiscoveryNode {
+  std::string name;
+  std::string address;
+  int result = ZOK;
+};
+// 可选快照用于模拟成功空列表、部分节点失败和目录查询失败。
+std::optional<std::vector<DiscoveryNode>> discovery_nodes;
+int discovery_children_result = ZOK;
 std::atomic<int> accept_error_fd{-1}, accept_error_code{0};
 std::mutex accept_error_mutex;
 std::condition_variable accept_error_cv;
@@ -102,10 +112,17 @@ int __wrap_zookeeper_close(zhandle_t* handle) {
 }
 int __wrap_zoo_get_children(zhandle_t*, const char*, int,
                             String_vector* children) {
-  children->count = 1;
-  children->data = new char*[1];
-  children->data[0] = new char[5];
-  std::memcpy(children->data[0], "node", 5);
+  std::lock_guard<std::mutex> lock(discovery_data_mutex);
+  if (discovery_children_result != ZOK) return discovery_children_result;
+  const std::vector<DiscoveryNode> nodes =
+      discovery_nodes.value_or(std::vector<DiscoveryNode>{{"node", ""}});
+  children->count = static_cast<int>(nodes.size());
+  children->data = nodes.empty() ? nullptr : new char*[nodes.size()];
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    children->data[i] = new char[nodes[i].name.size() + 1];
+    std::memcpy(children->data[i], nodes[i].name.c_str(),
+                nodes[i].name.size() + 1);
+  }
   return ZOK;
 }
 int __wrap_deallocate_String_vector(String_vector* children) {
@@ -115,11 +132,25 @@ int __wrap_deallocate_String_vector(String_vector* children) {
   children->count = 0;
   return ZOK;
 }
-int __wrap_zoo_get(zhandle_t*, const char*, int, char* buffer, int* length,
+int __wrap_zoo_get(zhandle_t*, const char* path, int, char* buffer, int* length,
                    Stat*) {
   std::string data;
   {
     std::lock_guard<std::mutex> lock(discovery_data_mutex);
+    if (discovery_nodes) {
+      const std::string node =
+          std::string(path).substr(std::string(path).rfind('/') + 1);
+      for (const auto& entry : *discovery_nodes) {
+        if (entry.name != node) continue;
+        if (entry.result != ZOK) return entry.result;
+        if (static_cast<int>(entry.address.size()) > *length)
+          return ZMARSHALLINGERROR;
+        std::memcpy(buffer, entry.address.data(), entry.address.size());
+        *length = static_cast<int>(entry.address.size());
+        return ZOK;
+      }
+      return ZNONODE;
+    }
     data = discovery_address_override.empty()
                ? "127.0.0.1:" + std::to_string(discovered_port.load())
                : discovery_address_override;
@@ -271,6 +302,11 @@ class NetworkTest : public testing::Test {
   TransportOptions transport_options;
   RateLimitOptions rate_limit_options;
   void SetUp() override {
+    {
+      std::lock_guard<std::mutex> lock(discovery_data_mutex);
+      discovery_nodes.reset();
+      discovery_children_result = ZOK;
+    }
     TestService();
     meeting_ctrl::ThreadPoolSingleton::Destroy();
     ASSERT_TRUE(meeting_ctrl::ThreadPoolSingleton::Init(1));
@@ -292,6 +328,11 @@ class NetworkTest : public testing::Test {
     cycle.reset();
     EXPECT_TRUE(meeting_ctrl::ThreadPoolSingleton::Destroy());
     EXPECT_EQ(ConnectionManager::GetInstance().GetConnectionCount(), 0u);
+    {
+      std::lock_guard<std::mutex> lock(discovery_data_mutex);
+      discovery_nodes.reset();
+      discovery_children_result = ZOK;
+    }
   }
 };
 
@@ -729,11 +770,13 @@ struct SharedKey {
 };
 class EchoTestService : public Service {
  public:
+  std::atomic<size_t> requests{0};
   explicit EchoTestService(std::string name, std::shared_ptr<Gate> gate = {})
       : name_(std::move(name)), gate_(std::move(gate)) {}
   std::string GetServiceName() const override { return name_; }
   bool HandleRequest(const std::string&, const std::string& args,
                      std::string& result) override {
+    ++requests;
     if (gate_) {
       gate_->started.set_value();
       gate_->signal.wait();
@@ -971,6 +1014,126 @@ TEST(RpcClientNetworkTest,
   EXPECT_EQ(response, "recovered");
   EXPECT_EQ(accepts.load(), 2);
   EXPECT_TRUE(server.get());
+}
+
+TEST_F(NetworkTest, LocalResponseFormatMismatchDoesNotSendOrTripTheBreaker) {
+  auto service = std::make_shared<EchoTestService>("LocalFormatEcho");
+  ASSERT_TRUE(ServiceManager::GetInstance().RegisterService(service));
+  ClientConfigFile config(listener.port,
+                          {{"circuit_breaker", {{"failure_threshold", 1}}}});
+  RpcClient client(config.path.string());
+  std::string response;
+  ASSERT_TRUE(client.Call("LocalFormatEcho", "Echo", std::string("before"),
+                          SerializeType::JSON, response));
+  rpc::tutorial::RpcResponse wrong_response;
+  wrong_response.set_payload("unchanged");
+  for (int i = 0; i < 6; ++i) {
+    EXPECT_FALSE(client.Call("LocalFormatEcho", "Echo", std::string("invalid"),
+                             SerializeType::JSON, wrong_response));
+    EXPECT_TRUE(client.IsConnected());
+  }
+  // 响应类型不兼容必须在发包前拒绝，不改变目标对象或实例健康状态。
+  EXPECT_EQ(service->requests.load(), 1u);
+  EXPECT_EQ(wrong_response.payload(), "unchanged");
+  rpc::tutorial::RpcRequest protobuf_request;
+  protobuf_request.set_payload("protobuf request");
+  EXPECT_FALSE(client.Call("LocalFormatEcho", "Echo", protobuf_request,
+                           SerializeType::PROTOBUF, response));
+  EXPECT_TRUE(client.IsConnected());
+  EXPECT_EQ(service->requests.load(), 1u);
+  ASSERT_TRUE(client.Call("LocalFormatEcho", "Echo", std::string("after"),
+                          SerializeType::JSON, response));
+  EXPECT_EQ(response, "after");
+  EXPECT_EQ(service->requests.load(), 2u);
+  // 兼容的 Protobuf 调用仍应正常执行，不能把类型检查变成统一拒绝。
+  rpc::tutorial::RpcRequest protobuf_response;
+  ASSERT_TRUE(client.Call("LocalFormatEcho", "Echo", protobuf_request,
+                          SerializeType::PROTOBUF, protobuf_response));
+  EXPECT_EQ(protobuf_response.payload(), "protobuf request");
+  EXPECT_EQ(service->requests.load(), 3u);
+}
+
+TEST_F(NetworkTest, PartialDiscoveryKeepsMissingEndpointInItsCooldown) {
+  Listener failing;
+  const std::string address_a = "127.0.0.1:" + std::to_string(failing.port);
+  const std::string address_b = "127.0.0.1:" + std::to_string(listener.port);
+  auto set_nodes = [](std::vector<DiscoveryNode> nodes) {
+    std::lock_guard<std::mutex> lock(discovery_data_mutex);
+    discovery_nodes = std::move(nodes);
+  };
+  ASSERT_TRUE(ServiceManager::GetInstance().RegisterService(
+      std::make_shared<EchoTestService>("PartialDiscoveryEcho")));
+  set_nodes({{"A", address_a}});
+  ClientConfigFile config(
+      listener.port,
+      {{"circuit_breaker",
+        {{"failure_threshold", 1}, {"reset_timeout_ms", 60000}}}});
+  RpcClient client(config.path.string());
+  auto server = std::async(std::launch::async, [&] {
+    pollfd ready{failing.fd.value, POLLIN, 0};
+    if (poll(&ready, 1, 2000) <= 0) return false;
+    auto peer = std::make_shared<Connection>(
+        accept(failing.fd.value, nullptr, nullptr));
+    if (ReadFrame(peer).empty()) return false;
+    peer->Close();
+    return true;
+  });
+  std::string response;
+  EXPECT_FALSE(client.Call("PartialDiscoveryEcho", "Echo", std::string("fails"),
+                           SerializeType::JSON, response));
+  ASSERT_TRUE(server.get());
+  // A 读取失败，B 仍可使用，但此部分结果不能清理 A 的熔断历史。
+  set_nodes({{"A", address_a, ZCONNECTIONLOSS}, {"B", address_b}});
+  ASSERT_TRUE(client.Call("PartialDiscoveryEcho", "Echo",
+                          std::string("healthy B"), SerializeType::JSON,
+                          response));
+  EXPECT_EQ(response, "healthy B");
+  client.Disconnect();
+  // 恢复后的完整列表仍包含 A，必须继续遵守原来的 60 秒冷却。
+  set_nodes({{"A", address_a}});
+  EXPECT_FALSE(client.Connect());
+  client.Disconnect();
+  // 完整的成功空列表才证明节点已移除，可清理历史并接纳重新出现的实例。
+  set_nodes({});
+  EXPECT_FALSE(client.Connect());
+  set_nodes({{"A", address_a}});
+  EXPECT_TRUE(client.Connect());
+}
+
+TEST_F(NetworkTest,
+       DiscoverySnapshotDistinguishesPartialFailureFromEmptySuccess) {
+  ZkConnHandler handler;
+  ASSERT_TRUE(handler.InitZkConnHandler({{"zk_host", "fake"}}));
+  const auto set_nodes = [](std::vector<DiscoveryNode> nodes) {
+    std::lock_guard<std::mutex> lock(discovery_data_mutex);
+    discovery_nodes = std::move(nodes);
+  };
+  for (int failure : {ZCONNECTIONLOSS, ZNONODE, ZMARSHALLINGERROR}) {
+    set_nodes({{"A", "address A", failure}, {"B", "address B"}});
+    const auto partial = handler.GetAllServersSnapshot("/cookrpc");
+    EXPECT_FALSE(partial.complete);
+    EXPECT_EQ(partial.servers, std::vector<std::string>{"address B"});
+    // 旧接口继续提供本轮可读地址，避免改变已有调用方的选址行为。
+    EXPECT_EQ(handler.GetAllServers("/cookrpc"), partial.servers);
+  }
+  set_nodes({{"A", ""}, {"B", "address B"}});
+  EXPECT_FALSE(handler.GetAllServersSnapshot("/cookrpc").complete);
+  set_nodes({{"A", "address A"}, {"B", "address B"}});
+  const auto complete = handler.GetAllServersSnapshot("/cookrpc");
+  EXPECT_TRUE(complete.complete);
+  EXPECT_EQ(complete.servers,
+            (std::vector<std::string>{"address A", "address B"}));
+  set_nodes({});
+  const auto empty = handler.GetAllServersSnapshot("/cookrpc");
+  EXPECT_TRUE(empty.complete);
+  EXPECT_TRUE(empty.servers.empty());
+  {
+    std::lock_guard<std::mutex> lock(discovery_data_mutex);
+    discovery_children_result = ZCONNECTIONLOSS;
+  }
+  const auto failed = handler.GetAllServersSnapshot("/cookrpc");
+  EXPECT_FALSE(failed.complete);
+  EXPECT_TRUE(failed.servers.empty());
 }
 }  // namespace
 }  // namespace cookrpc

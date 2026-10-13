@@ -57,6 +57,14 @@ class RpcClientSession {
         CLIENT_ERROR("Service name and method name must not be empty");
         return false;
       }
+      // 类型与线格式不兼容是本地参数错误，不应发包、建连或占用熔断探测。
+      if (!SerializerManager::IsCompatible<Request>(serialize_type) ||
+          !SerializerManager::IsCompatible<Response>(serialize_type)) {
+        CLIENT_ERROR(
+            "RPC request or response type does not match the serialization "
+            "format");
+        return false;
+      }
       if (!CheckConnection()) {
         return false;
       }
