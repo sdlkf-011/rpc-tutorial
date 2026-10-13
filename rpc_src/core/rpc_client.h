@@ -29,7 +29,7 @@ class RpcClientSession {
  public:
   // 使用指定配置文件创建客户端；未提供路径时使用默认配置。
   explicit RpcClientSession(
-      const std::string& config_path = "../config/rpc_client.json");
+      const std::string& config_path = "config/rpc_client.json");
   // 释放连接及其相关资源。
   ~RpcClientSession();
 
@@ -241,7 +241,7 @@ class RpcClientSession {
 // 客户端对象只持有共享会话，异步任务独立拥有会话及其连接资源。
 class RpcClient {
  public:
-  explicit RpcClient(const std::string& path = "../config/rpc_client.json")
+  explicit RpcClient(const std::string& path = "config/rpc_client.json")
       : session_(std::make_shared<detail::RpcClientSession>(path)) {}
   ~RpcClient() = default;
   RpcClient(const RpcClient&) = delete;

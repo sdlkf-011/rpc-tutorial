@@ -23,7 +23,7 @@
 namespace {
 
 // 默认值与上限模块：限制并发数、请求数和报文大小，避免误操作占满资源。
-constexpr char kDefaultConfigPath[] = "../config/rpc_client.json";
+constexpr char kDefaultConfigPath[] = "config/rpc_client.json";
 constexpr size_t kDefaultThreads = 4;
 constexpr uint64_t kDefaultRequests = 10000;
 constexpr size_t kDefaultPayloadSize = 64;
@@ -204,7 +204,7 @@ int main(int argc, char* argv[]) {
     PrintUsage(argv[0]);
     return 2;
   }
-  if (!Logger::GetInstance().Init("../logs")) {
+  if (!Logger::GetInstance().Init("logs")) {
     std::cerr << "Failed to initialize logger\n";
     return 1;
   }

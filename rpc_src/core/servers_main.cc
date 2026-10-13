@@ -24,7 +24,7 @@
 
 namespace {
 
-constexpr char kDefaultConfigPath[] = "../config/rpc_server.json";
+constexpr char kDefaultConfigPath[] = "config/rpc_server.json";
 
 // 屏蔽终止信号，交由专用线程通过 sigwait 统一处理。
 bool BlockTerminationSignals(sigset_t& termination_signals) {
@@ -109,7 +109,7 @@ void ShutdownThreadPool(uint32_t timeout_ms) {
 
 int main(int argc, char* argv[]) {
   // 初始化日志与进程信号模块。
-  if (!Logger::GetInstance().Init("../logs")) {
+  if (!Logger::GetInstance().Init("logs")) {
     std::cerr << "Failed to initialize logger" << std::endl;
     return 1;
   }

@@ -70,7 +70,7 @@ class Logger {
   }
 
   // 初始化日志系统
-  bool Init(const std::string& log_dir = "../logs") {
+  bool Init(const std::string& log_dir = "logs") {
     try {
       // 创建日志目录
       std::filesystem::path log_path(log_dir);

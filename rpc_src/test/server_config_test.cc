@@ -120,6 +120,24 @@ TEST_F(ServerConfigTest, ThreadPoolRejectsInvalidNumbersWithoutPartialChanges) {
   EXPECT_FALSE(pool.InitThreadPoolConfig(candidate));
 }
 
+TEST_F(ServerConfigTest, RegistryPathIsRelativeToServerConfigDirectory) {
+  std::ofstream(registry_path) << nlohmann::json{
+      {"service_name", "relative_registry"},
+      {"registry_nodes",
+       nlohmann::json::array({{{"address", "127.0.0.1"}, {"port", 8989}}})}};
+  auto json = Good();
+  json["register_config"] = registry_path.filename().string();
+  ASSERT_TRUE(Load(json));
+  EXPECT_EQ(config.GetServiceRegistryConfig()->GetServiceName(),
+            "relative_registry");
+  EXPECT_EQ(config.GetServiceRegistryConfig()->GetRegistryNodesSize(), 1u);
+
+  json["register_config"] = registry_path.string();
+  ASSERT_TRUE(Load(json));
+  EXPECT_EQ(config.GetServiceRegistryConfig()->GetServiceName(),
+            "relative_registry");
+}
+
 TEST_F(ServerConfigTest,
        RegistryReloadReplacesNodesAndRejectsInvalidNodeAtomically) {
   ServiceRegistryConfig registry;

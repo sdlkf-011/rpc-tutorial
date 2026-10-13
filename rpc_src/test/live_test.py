@@ -124,9 +124,12 @@ class ZooKeeper:
         self.classpath = classpath
         self.process = None
 
-    def start(self):
-        self.process = subprocess.Popen(['java', '-Dzookeeper.nio.numWorkerThreads=4', '-cp', self.classpath,
-            'org.apache.zookeeper.server.quorum.QuorumPeerMain', str(self.config)], stdout=self.log, stderr=subprocess.STDOUT)
+    def start(self, *, command=None, cwd=None, env=None):
+        if command is None:
+            command = ['java', '-Dzookeeper.nio.numWorkerThreads=4', '-cp', self.classpath,
+                'org.apache.zookeeper.server.quorum.QuorumPeerMain', str(self.config)]
+        self.process = subprocess.Popen(command, cwd=cwd, env=env,
+                                        stdout=self.log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if self.process.poll() is not None: raise RuntimeError('ZooKeeper startup failed')
