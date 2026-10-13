@@ -68,5 +68,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/live_test.py"
                 --driver "$<TARGET_FILE:live_integration_test>")
         set_tests_properties(live_tcp_zookeeper PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+        add_test(NAME startup_regression
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/startup_test.py"
+                --server "$<TARGET_FILE:rpc_server>"
+                --client "$<TARGET_FILE:rpc_client>"
+                --stress-client "$<TARGET_FILE:stress_test_client>"
+                --config-dir "${PROJECT_SOURCE_DIR}/config"
+                --zk-launcher "${PROJECT_SOURCE_DIR}/zk_start.sh")
+        set_tests_properties(startup_regression PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endif()
 endif()

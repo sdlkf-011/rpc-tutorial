@@ -34,12 +34,15 @@ Options:
   --client-config PATH   RPC client config file
   --server-config PATH   RPC server config file used with --start-server
   --build-dir PATH       Build directory (default: project build/)
-  --server-log PATH      Log file used with --start-server
+  --server-log PATH      Server console output used with --start-server
   --shutdown-timeout N   Grace period before killing owned processes (1-60 seconds; default: 10)
   --help                 Show this help message
 
-The script requires ZooKeeper and a registered RPC service. Parameters can
-also be set with BUILD_DIR, BUILD_FIRST, START_SERVER, THREADS, REQUESTS,
+The script requires a running ZooKeeper. Without --start-server, the RPC
+service must already be running and registered. Child programs run from the
+project root and write RPC file logs to logs/. Relative CLI paths are resolved
+from the caller's directory. Parameters can also be set with BUILD_DIR,
+BUILD_FIRST, START_SERVER, THREADS, REQUESTS,
 PAYLOAD_SIZE, CLIENT_CONFIG, SERVER_CONFIG, SERVER_LOG, and SHUTDOWN_TIMEOUT_SECONDS
 environment variables.
 EOF
@@ -193,8 +196,8 @@ if [[ "${START_SERVER}" == "1" ]]; then
   echo "Starting local RPC server (log: ${SERVER_LOG})..."
   mkdir -p -- "$(dirname "${SERVER_LOG}")"
   (
-    cd "${BUILD_DIR}"
-    exec setsid ./rpc_server "${SERVER_CONFIG}"
+    cd "${PROJECT_ROOT}"
+    exec setsid "${BUILD_DIR}/rpc_server" "${SERVER_CONFIG}"
   ) >"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
 
@@ -212,11 +215,11 @@ if [[ "${START_SERVER}" == "1" ]]; then
     fail "timed out waiting for the RPC server to start"
 fi
 
-# 压测执行模块：从构建目录运行，以保持日志和默认相对路径行为一致。
+# 压测执行模块：统一从仓库根目录运行，使日志位于项目的 logs/。
 echo "Running stress test: threads=${THREADS}, requests=${REQUESTS}, payload=${PAYLOAD_SIZE} bytes"
 (
-  cd "${BUILD_DIR}"
-  exec setsid ./stress_test_client \
+  cd "${PROJECT_ROOT}"
+  exec setsid "${BUILD_DIR}/stress_test_client" \
     --config "${CLIENT_CONFIG}" \
     --threads "${THREADS}" \
     --requests "${REQUESTS}" \

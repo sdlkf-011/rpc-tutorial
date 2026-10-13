@@ -59,105 +59,70 @@ ZooKeeper C client 必须启用同步 API。使用 vcpkg 时安装 `zookeeper[sy
 
 ## 快速开始
 
-以下操作从仓库根目录开始。先构建 RPC 程序，再启动 ZooKeeper、RPC 服务端和客户端。
+先满足[环境要求](#环境要求)，自行切换到仓库根目录后执行项目命令。
 
-### 1. 安装依赖并构建
+### 1. 启动 ZooKeeper
 
-```bash
-export VCPKG_ROOT=/path/to/vcpkg
-export VCPKG_TARGET_TRIPLET=x64-linux
-
-"$VCPKG_ROOT/vcpkg" install openssl protobuf fmt spdlog nlohmann-json \
-  zstd 'zookeeper[sync]' gtest --triplet "$VCPKG_TARGET_TRIPLET"
-
-./rpc_build.sh
-```
-
-如果通过系统包或其他依赖前缀安装，可以直接配置 CMake：
+**已安装并配置 ZooKeeper：** 服务已经运行则跳过。通过 Ubuntu / Debian 的 `zookeeper` 软件包安装时，启动脚本位于以下路径：
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build --parallel
+sudo /usr/share/zookeeper/bin/zkServer.sh start
 ```
 
-依赖不在默认搜索路径时，为上述配置命令追加 `-DCMAKE_PREFIX_PATH=/path/to/dependency-prefix`。构建产生 `rpc_server`、`rpc_client` 和 `stress_test_client`，Protobuf 生成文件位于 `build/generated/`。
+该启动方式读取 `/etc/zookeeper/conf/zoo.cfg`；项目的 `config/zoo.cfg` 由下面的 `zk_start.sh` 使用。
 
-### 2. 安装并启动 ZooKeeper
+官方二进制解压包使用其实际安装目录中的 `bin/zkServer.sh`。仅通过 vcpkg 安装 `zookeeper[sync]` 时，得到的是 C 客户端库，不包含服务端或启动脚本，需要先安装下面的服务端组件。
 
-如果已有可访问的 ZooKeeper，可以跳过本地安装与启动，并在下一步将服务端和客户端配置指向该服务。以下示例使用 Ubuntu / Debian 系统包，在本机前台运行一个 ZooKeeper 实例。
-
-安装 Java 运行时、ZooKeeper 服务端及日志依赖：
+**尚未配置 ZooKeeper：** 可以使用项目提供的 [config/zoo.cfg](config/zoo.cfg)。Ubuntu / Debian 尚未安装相关组件时，先执行：
 
 ```bash
 sudo apt-get update
 sudo apt-get install default-jre-headless zookeeper libslf4j-java
 ```
 
-在仓库根目录创建本地配置和数据目录：
+随后在仓库根目录执行：
 
 ```bash
-mkdir -p .cache/zk-local/data
-cat > .cache/zk-local/zoo.cfg <<EOF
-tickTime=2000
-dataDir=$PWD/.cache/zk-local/data
-clientPort=2181
-clientPortAddress=127.0.0.1
-EOF
+./zk_start.sh
 ```
 
-在终端一启动 ZooKeeper：
+脚本使用提供的配置、创建数据目录并启动 ZooKeeper，默认端口 `2181`。保持该终端运行，按 `Ctrl+C` 停止。使用官方二进制发行包时，先执行 `export ZOOKEEPER_HOME=/实际解压目录`，再执行同一脚本。
+
+### 2. 核对连接配置
+
+将以下配置改为实际使用的地址：
+
+| 文件 | 配置项 | 含义 |
+| --- | --- | --- |
+| [config/rpc_server.json](config/rpc_server.json) | `scheduler.zk_host` / `zk_port` | ZooKeeper 地址与端口 |
+| [config/rpc_client.json](config/rpc_client.json) | `zk_host` / `zk_port` | 与服务端连接同一套 ZooKeeper |
+| [config/servers.json](config/servers.json) | `registry_nodes[].address` / `port` | 客户端可访问的 RPC 服务端 IPv4 与端口，端口默认 `8989` |
+
+跨设备访问时，ZooKeeper 的监听地址需允许两端连接，并放行 TCP `2181` 和 RPC 端口；使用提供的 `zoo.cfg` 时，将 `clientPortAddress` 改为 ZooKeeper 设备的可访问 IPv4，修改后重启 ZooKeeper。注册地址使用实际服务器 IP，`0.0.0.0` 仅用于监听。
+
+服务端会自动创建 `/cookrpc/cookrpc_service` 持久目录并注册临时实例节点，无需手动创建节点。
+
+### 3. 编译并启动项目
+
+编译只需执行：
 
 ```bash
-java -Dzookeeper.admin.enableServer=false \
-  -cp '/usr/share/java/zookeeper.jar:/usr/share/java/slf4j-simple.jar' \
-  org.apache.zookeeper.server.quorum.QuorumPeerMain \
-  "$PWD/.cache/zk-local/zoo.cfg"
+sh rpc_build.sh
 ```
 
-该命令关闭可选的 HTTP 管理接口，RPC 只使用 ZooKeeper 客户端通信端口。保持这个终端运行；按 `Ctrl+C` 会停止 ZooKeeper。使用系统服务或其他方式管理 ZooKeeper 时，无需执行上述前台启动命令。其他发行版的安装位置可能不同，也可以使用 [ZooKeeper 官方发行包和启动指南](https://zookeeper.apache.org/doc/current/zookeeperStarted.html)。
-
-在另一个终端检查连接：
+在一个终端启动服务端：
 
 ```bash
-java -cp '/usr/share/java/zookeeper.jar:/usr/share/java/slf4j-simple.jar' \
-  org.apache.zookeeper.ZooKeeperMain -server 127.0.0.1:2181
+./build/rpc_server
 ```
 
-看到 `SyncConnected` 后输入 `ls /`，能返回节点列表即表示 ZooKeeper 可用；输入 `quit` 退出检查客户端，ZooKeeper 服务端继续运行。`2181` 使用 ZooKeeper 协议，后面的 `8989` 使用本项目 RPC 协议，均不能通过浏览器访问 `http://localhost:端口/`。
-
-### 3. 核对示例配置
-
-确认 ZooKeeper 已启动，并核对以下三个文件：
-
-- [rpc_server.json](config/rpc_server.json)：监听地址、线程池和 ZooKeeper 连接参数。
-- [servers.json](config/servers.json)：注册的服务目录名及实际可访问的 `ip:port`。
-- [rpc_client.json](config/rpc_client.json)：ZooKeeper 地址和待发现的实例目录。
-
-示例监听端口与注册地址端口均为 `8989`。修改监听地址或端口时，同步修改 `servers.json`；注册地址应是客户端可访问的地址。
-
-连接远程 ZooKeeper 时，同步修改 `rpc_server.json` 中的 `scheduler.zk_host` / `zk_port` 和 `rpc_client.json` 中的 `zk_host` / `zk_port`。客户端和服务端必须访问同一套 ZooKeeper。跨机器调用时，`servers.json` 中的注册地址也应改成客户端可访问的服务器 IPv4 地址。
-
-### 4. 启动 RPC 服务端
-
-在终端二从仓库根目录执行：
+看到 `RPC server started on 0.0.0.0:8989` 后，保持服务端运行，在另一个终端执行：
 
 ```bash
-cd build
-./rpc_server ../config/rpc_server.json
+./build/rpc_client
 ```
 
-保持这个终端运行。看到 `RPC server started on 0.0.0.0:8989` 表示监听和 ZooKeeper 发布均已成功；`Service registered successfully: RpcService` 仅表示进程内业务服务注册完成。
-
-### 5. 调用 RPC 服务
-
-在终端三从仓库根目录执行：
-
-```bash
-cd build
-./rpc_client ../config/rpc_client.json "Hello, cookrpc"
-```
-
-成功时输出：
+成功时返回：
 
 ```json
 {
@@ -166,13 +131,7 @@ cd build
 }
 ```
 
-客户端调用完成后自动退出。若提示 `Failed to connect to ZooKeeper`，先检查 ZooKeeper 进程是否仍在运行、配置地址是否正确，并通过上面的检查客户端确认服务可用，再重新启动 RPC 服务端和客户端。
-
-复用数据目录重启 ZooKeeper 后，旧会话的临时实例节点可能尚未过期。若服务端提示 `Timed out acquiring registry instance ownership`，应确认旧 RPC 实例已停止，等待旧会话过期后重试；默认会话超时为 30 秒，本地联调可等待约 35 秒再重试，无需手动删除实例节点。
-
-ZooKeeper 注册使用覆盖排队、创建、检查和 watch 等待的总期限。结果不确定的超时会话由后台退役，关闭或过期后清理临时节点，并以新会话恢复已确认注册。
-
-服务端接收 `SIGINT` 或 `SIGTERM` 后停止接收新请求，尝试发送在途响应，再等待业务任务完成并清理注册会话。普通 C++ 任务不能被安全强制终止，因此退出时间可能超过配置中的等待时间。
+客户端调用完成后退出，ZooKeeper 和 RPC 服务端需保持运行。
 
 ## 配置说明
 
@@ -203,7 +162,7 @@ ZooKeeper 连接就绪后才提交新的客户端配置；提交时断开现有 
 | `thread_pool.keep_alive_time` | 非核心线程空闲退出时间，单位秒 |
 | `scheduler.zk_host` / `zk_port` | 服务端注册与发现处理器的 ZooKeeper 地址 |
 | `scheduler.retry_interval` | 毫秒值，入口转换为至少 1 秒的 ZooKeeper 等待间隔 |
-| `register_config` | 服务注册配置文件路径，如 `../config/servers.json` |
+| `register_config` | 服务注册配置文件路径，相对路径按服务端配置所在目录解析，如 `servers.json` |
 
 监听和注册地址使用标准 IPv4 文本，配置与 socket 层采用相同校验，拒绝前导零、空白和嵌入 NUL。
 
@@ -215,7 +174,13 @@ ZooKeeper 连接就绪后才提交新的客户端配置；提交时断开现有 
 
 服务端配置中的顶层及 `scheduler.load_balance_strategy` 不参与入口的策略初始化。客户端通过自己的 `load_balance_strategy` 选择策略。
 
-直接启动可执行程序时，相对路径以进程工作目录为基准；`register_config` 也遵循此规则。示例程序的日志目录为 `../logs`，文件日志每天零点滚动，文件名为 `cookrpc_YYYY-MM-DD.log`。使用自定义构建目录时，可为注册配置填写绝对路径。
+服务端、客户端和压测程序从仓库根目录启动，默认读取 `config/` 下的配置，日志写入 `logs/`。这些相对路径按进程工作目录解析，由用户在启动前切换到仓库根目录。文件日志每天零点滚动，文件名为 `cookrpc_YYYY-MM-DD.log`。
+
+命令行传入的相对配置路径也按进程工作目录解析。服务端配置中的 `register_config` 相对路径按该服务端配置所在目录解析，绝对路径直接使用。
+
+ZooKeeper 注册使用覆盖排队、创建、检查和 watch 等待的总期限。结果不确定的超时会话由后台退役，关闭或过期后清理临时节点，并以新会话恢复已确认注册。
+
+服务端接收 `SIGINT` 或 `SIGTERM` 后停止接收新请求，尝试发送在途响应，再等待业务任务完成并清理注册会话。普通 C++ 任务不能被安全强制终止，因此退出时间可能超过配置中的等待时间。
 
 ### 压缩、加密、限流与熔断
 
@@ -262,6 +227,16 @@ RPC 加密必须使用显式共享密钥，缺失或格式错误时配置加载�
 
 ## 构建选项
 
+使用已安装的 vcpkg 准备构建依赖时，将路径替换为实际安装目录。x86_64 Linux 使用 `x64-linux`，ARM64 Linux 使用 `arm64-linux`：
+
+```bash
+export VCPKG_ROOT=/path/to/vcpkg
+export VCPKG_TARGET_TRIPLET=x64-linux
+"$VCPKG_ROOT/vcpkg" install openssl protobuf fmt spdlog nlohmann-json zstd 'zookeeper[sync]' gtest --triplet "$VCPKG_TARGET_TRIPLET"
+```
+
+构建时保持这些环境变量有效，也可以写入 shell 配置。构建脚本不会自动安装依赖。
+
 `rpc_build.sh` 支持以下环境变量：
 
 | 变量 | 含义 |
@@ -270,6 +245,7 @@ RPC 加密必须使用显式共享密钥，缺失或格式错误时配置加载�
 | `BUILD_TYPE` / `BUILD_JOBS` | 构建类型与并行任务数；默认 `Debug` 与 `nproc` |
 | `VCPKG_ROOT` | vcpkg 根目录；未提供时尝试从 `PATH` 查找 |
 | `CMAKE_TOOLCHAIN_FILE` | 显式指定工具链，优先于自动选择的 vcpkg 工具链 |
+| `CMAKE_PREFIX_PATH` | 额外依赖安装前缀；通过环境变量提供给 CMake 的依赖查找 |
 | `VCPKG_TARGET_TRIPLET` | 依赖目标 triplet，优先于 `VCPKG_DEFAULT_TRIPLET` 和宿主默认值 |
 
 脚本将选定 triplet 显式传给 CMake，并记录工具链、triplet、依赖前缀、编译器及生成器的环境签名。签名改变后，会清除该构建目录的 `CMakeCache.txt` 和 `CMakeFiles` 再配置。
@@ -291,10 +267,10 @@ ctest --test-dir build --output-on-failure
 ```bash
 cmake -S . -B build -DRPC_ENABLE_LIVE_TESTS=ON
 cmake --build build --parallel
-ctest --test-dir build -R live_tcp_zookeeper --output-on-failure
+ctest --test-dir build -R 'live_tcp_zookeeper|startup_regression' --output-on-failure
 ```
 
-该测试临时启动 ZooKeeper，验证慢读背压、真实发现与调用、会话过期后的自动注册，以及 ZooKeeper 和 TCP 服务重启后的可发现性。缺少 Java 或默认 jars 时显示跳过，可通过 `ZK_SERVER_CLASSPATH` 指定安装位置。
+这些测试临时启动 ZooKeeper，验证慢读背压、真实发现与调用、会话过期后的自动注册，以及 ZooKeeper 和 TCP 服务重启后的可发现性。启动测试按快速开始的说明，从仓库根目录启动 ZooKeeper、服务端和客户端，验证默认配置与 Echo 调用。缺少 Java 或默认 jars 时显示跳过，可通过 `ZK_SERVER_CLASSPATH` 指定安装位置。
 
 需要保留日志时：
 
@@ -349,6 +325,8 @@ ZooKeeper 和 RPC 服务均已就绪时：
   --server-log './test logs/server.log' --start-server
 ```
 
+脚本从仓库根目录运行子进程，RPC 文件日志写入 `logs/`。`--server-log` 指定服务端控制台输出文件，默认位于所选构建目录的 `stress_test_server.log`。
+
 压测使用多个独立客户端与长连接，并发调用 `RpcService.Echo`，校验返回消息，输出成功率、吞吐量、平均延迟及 P50/P95/P99。连接准备不计入测试窗口；延迟样本包含成功与失败调用。错误类型、缺失字段和不匹配的 Echo 值均计为失败，压测返回非零状态。具体参数与环境变量见 `./stress_test.sh --help`。
 
 脚本跟踪自己启动的构建、客户端和服务端进程组；`SIGINT` 与 `SIGTERM` 分别返回 130、143，并清理这些进程及其子进程。停止宽限期默认 10 秒，可通过 `--shutdown-timeout` 或 `SHUTDOWN_TIMEOUT_SECONDS` 设置为 1–60 秒；宽限期后仍未退出的进程会被强制结束，可能中止在途请求。
@@ -357,7 +335,7 @@ ZooKeeper 和 RPC 服务均已就绪时：
 
 ```text
 cmake/                      依赖查找与目标配置辅助模块
-config/                     服务端、客户端及注册节点配置
+config/                     服务端、客户端、注册节点及本地 ZooKeeper 配置
 protos/                     Protobuf 消息定义
 rpc_src/
   core/                     程序入口、客户端、Echo 示例、错误码
@@ -373,6 +351,7 @@ rpc_src/
   tools/                    压测客户端
   test/                     单元、并发、脚本及真实集成测试
 utils/                      日志与工具函数
+zk_start.sh                 本地 ZooKeeper 前台启动脚本
 ```
 
 ## 实现边界

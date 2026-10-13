@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+# 兼容教程中的 sh rpc_build.sh，后续构建逻辑统一交给 Bash 执行。
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

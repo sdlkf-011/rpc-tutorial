@@ -7,7 +7,7 @@
 
 namespace {
 
-constexpr char kDefaultConfigPath[] = "../config/rpc_client.json";
+constexpr char kDefaultConfigPath[] = "config/rpc_client.json";
 constexpr char kDefaultMessage[] = "Hello, cookrpc";
 
 }  // namespace
@@ -15,7 +15,7 @@ constexpr char kDefaultMessage[] = "Hello, cookrpc";
 int main(int argc, char* argv[]) {
   // 初始化日志模块。
   // 客户端和公共组件共用同一个日志实例。
-  if (!Logger::GetInstance().Init("../logs")) {
+  if (!Logger::GetInstance().Init("logs")) {
     std::cerr << "Failed to initialize logger" << std::endl;
     return 1;
   }

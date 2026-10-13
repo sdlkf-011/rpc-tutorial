@@ -1,5 +1,6 @@
 #include "rpc_server_config.h"
 
+#include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
 
@@ -42,10 +43,17 @@ bool RpcServerConfig::InitRpcServerConfig(const std::string& filename) {
     if (!candidate.thread_pool_config_->InitThreadPoolConfig(
             json.value("thread_pool", nlohmann::json::object())))
       return false;
-    if (json.contains("register_config") &&
-        !candidate.service_registry_config_->InitRegistryConfig(
-            config_validation::ReadString(json, "register_config", "")))
-      return false;
+    if (json.contains("register_config")) {
+      std::filesystem::path registry_path =
+          config_validation::ReadString(json, "register_config", "");
+      // 子配置跟随主配置移动，不依赖启动程序时的工作目录。
+      if (registry_path.is_relative())
+        registry_path = std::filesystem::path(filename).parent_path() /
+                        registry_path;
+      if (!candidate.service_registry_config_->InitRegistryConfig(
+              registry_path.lexically_normal().string()))
+        return false;
+    }
     servers_name_prefix_.swap(candidate.servers_name_prefix_);
     servers_ip_.swap(candidate.servers_ip_);
     servers_port_ = candidate.servers_port_;
